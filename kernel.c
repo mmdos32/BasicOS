@@ -1,10 +1,50 @@
-/* kernel.c - MiniOS: VGA text, GDT/IDT, PIC/PIT, keyboard, preemptive multitasking, shell */
+/* kernel.c - BasicOS v0.2
+ * VGA text, GDT/IDT, PIC/PIT, keyboard, preemptive multitasking,
+ * heap allocator, in-memory filesystem, shell.
+ */
 #include <stdint.h>
 #include <stddef.h>
+
+#define OS_NAME    "BasicOS"
+#define OS_VERSION "0.2"
 
 /* ---------------------------------------------------------------- port I/O */
 static inline void outb(uint16_t p, uint8_t v) { __asm__ volatile("outb %0, %1" :: "a"(v), "Nd"(p)); }
 static inline uint8_t inb(uint16_t p) { uint8_t v; __asm__ volatile("inb %1, %0" : "=a"(v) : "Nd"(p)); return v; }
+
+/* ---------------------------------------------------------------- libc bits */
+void *memcpy(void *d, const void *s, size_t n) {
+    uint8_t *dp = d; const uint8_t *sp = s;
+    while (n--) *dp++ = *sp++;
+    return d;
+}
+
+void *memset(void *d, int v, size_t n) {
+    uint8_t *dp = d;
+    while (n--) *dp++ = (uint8_t)v;
+    return d;
+}
+
+static size_t strlen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
+
+static int strcmp(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return (uint8_t)*a - (uint8_t)*b;
+}
+
+static int atoi(const char *s) {
+    int n = 0;
+    while (*s >= '0' && *s <= '9') n = n * 10 + (*s++ - '0');
+    return n;
+}
+
+static void utoa(uint32_t n, char *buf) {
+    char tmp[12]; int i = 0, j = 0;
+    if (n == 0) tmp[i++] = '0';
+    while (n) { tmp[i++] = '0' + n % 10; n /= 10; }
+    while (i) buf[j++] = tmp[--i];
+    buf[j] = 0;
+}
 
 /* ---------------------------------------------------------------- VGA text */
 #define VGA ((volatile uint16_t *)0xB8000)
@@ -42,38 +82,13 @@ static void putc(char c) {
 
 static void puts(const char *s) { while (*s) putc(*s++); }
 
+static void put_uint(uint32_t n) { char b[12]; utoa(n, b); puts(b); }
+
 static void clear_screen(void) {
     for (int y = 1; y < ROWS; y++)
         for (int x = 0; x < COLS; x++) vga_at(x, y, ' ', color);
     cx = 0; cy = 1;
     cursor_update();
-}
-
-static void utoa(uint32_t n, char *buf) {
-    char tmp[12]; int i = 0, j = 0;
-    if (n == 0) tmp[i++] = '0';
-    while (n) { tmp[i++] = '0' + n % 10; n /= 10; }
-    while (i) buf[j++] = tmp[--i];
-    buf[j] = 0;
-}
-
-static void put_uint(uint32_t n) { char b[12]; utoa(n, b); puts(b); }
-
-/* ---------------------------------------------------------------- strings */
-static int strcmp(const char *a, const char *b) {
-    while (*a && *a == *b) { a++; b++; }
-    return (uint8_t)*a - (uint8_t)*b;
-}
-
-static int strncmp(const char *a, const char *b, size_t n) {
-    while (n && *a && *a == *b) { a++; b++; n--; }
-    return n ? (uint8_t)*a - (uint8_t)*b : 0;
-}
-
-static int atoi(const char *s) {
-    int n = 0;
-    while (*s >= '0' && *s <= '9') n = n * 10 + (*s++ - '0');
-    return n;
 }
 
 /* ---------------------------------------------------------------- GDT */
@@ -89,7 +104,6 @@ static void gdt_set(int i, uint8_t access, uint8_t gran) {
 }
 
 static void gdt_init(void) {
-    gdt[0] = (struct gdt_entry){0};
     gdt_set(1, 0x9A, 0xCF);             /* code, ring 0, flat 4GB */
     gdt_set(2, 0x92, 0xCF);             /* data, ring 0, flat 4GB */
     gdtr.limit = sizeof(gdt) - 1;
@@ -127,11 +141,11 @@ static void idt_init(void) {
 }
 
 static void pic_init(void) {
-    outb(0x20, 0x11); outb(0xA0, 0x11);     /* init */
-    outb(0x21, 0x20); outb(0xA1, 0x28);     /* remap: IRQ0-7 -> 32.., IRQ8-15 -> 40.. */
-    outb(0x21, 0x04); outb(0xA1, 0x02);     /* cascade */
-    outb(0x21, 0x01); outb(0xA1, 0x01);     /* 8086 mode */
-    outb(0x21, 0xFC);                        /* unmask IRQ0 (timer) + IRQ1 (keyboard) */
+    outb(0x20, 0x11); outb(0xA0, 0x11);
+    outb(0x21, 0x20); outb(0xA1, 0x28);
+    outb(0x21, 0x04); outb(0xA1, 0x02);
+    outb(0x21, 0x01); outb(0xA1, 0x01);
+    outb(0x21, 0xFC);                    /* unmask IRQ0 (timer) + IRQ1 (keyboard) */
     outb(0xA1, 0xFF);
 }
 
@@ -148,6 +162,117 @@ static void pit_init(void) {
 void exception_handler(void) {
     color = 0x4F;
     puts("\n*** CPU EXCEPTION - system halted ***");
+}
+
+/* ---------------------------------------------------------------- heap allocator
+ * First-fit free list over a static arena. Only the shell (task 0) allocates,
+ * so no locking is needed.
+ */
+#define HEAP_SIZE (256 * 1024)
+
+typedef struct block {
+    uint32_t size;
+    uint32_t free;
+    struct block *next;
+    uint32_t pad;               /* keeps the header at 16 bytes */
+} block_t;
+
+static uint8_t heap[HEAP_SIZE] __attribute__((aligned(16)));
+static block_t *heap_head;
+
+static void heap_init(void) {
+    heap_head = (block_t *)heap;
+    heap_head->size = HEAP_SIZE - sizeof(block_t);
+    heap_head->free = 1;
+    heap_head->next = NULL;
+}
+
+static void *kmalloc(uint32_t n) {
+    n = (n + 15) & ~15u;
+    if (n == 0) n = 16;
+    for (block_t *b = heap_head; b; b = b->next) {
+        if (!b->free || b->size < n) continue;
+        if (b->size >= n + sizeof(block_t) + 16) {      /* split */
+            block_t *s = (block_t *)((uint8_t *)(b + 1) + n);
+            s->size = b->size - n - sizeof(block_t);
+            s->free = 1;
+            s->next = b->next;
+            b->next = s;
+            b->size = n;
+        }
+        b->free = 0;
+        return b + 1;
+    }
+    return NULL;
+}
+
+static void kfree(void *p) {
+    if (!p) return;
+    ((block_t *)p - 1)->free = 1;
+    for (block_t *c = heap_head; c; c = c->next) {      /* coalesce */
+        while (c->free && c->next && c->next->free) {
+            c->size += sizeof(block_t) + c->next->size;
+            c->next = c->next->next;
+        }
+    }
+}
+
+static void heap_stats(uint32_t *used, uint32_t *freeb) {
+    *used = 0; *freeb = 0;
+    for (block_t *b = heap_head; b; b = b->next) {
+        if (b->free) *freeb += b->size; else *used += b->size;
+    }
+}
+
+/* ---------------------------------------------------------------- RAM filesystem */
+#define MAX_FILES 16
+#define NAME_LEN  16
+
+typedef struct {
+    char name[NAME_LEN];
+    char *data;
+    uint32_t size;
+    int used;
+} file_t;
+
+static file_t files[MAX_FILES];
+
+static file_t *fs_find(const char *name) {
+    for (int i = 0; i < MAX_FILES; i++)
+        if (files[i].used && !strcmp(files[i].name, name)) return &files[i];
+    return NULL;
+}
+
+/* returns 0 on success, -1 bad name, -2 out of file slots, -3 out of memory */
+static int fs_write(const char *name, const char *text) {
+    size_t nl = strlen(name);
+    if (nl == 0 || nl >= NAME_LEN) return -1;
+
+    uint32_t len = strlen(text);
+    char *buf = kmalloc(len + 1);
+    if (!buf) return -3;
+    memcpy(buf, text, len + 1);
+
+    file_t *f = fs_find(name);
+    if (f) {
+        kfree(f->data);
+    } else {
+        for (int i = 0; i < MAX_FILES; i++) if (!files[i].used) { f = &files[i]; break; }
+        if (!f) { kfree(buf); return -2; }
+        memcpy(f->name, name, nl + 1);
+        f->used = 1;
+    }
+    f->data = buf;
+    f->size = len;
+    return 0;
+}
+
+static int fs_remove(const char *name) {
+    file_t *f = fs_find(name);
+    if (!f) return -1;
+    kfree(f->data);
+    f->used = 0;
+    return 0;
 }
 
 /* ---------------------------------------------------------------- multitasking */
@@ -189,6 +314,12 @@ static void task_main(void) {
     task_exit();
 }
 
+static void set_name(char *dst, const char *src, int max) {
+    int j = 0;
+    while (src[j] && j < max - 1) { dst[j] = src[j]; j++; }
+    dst[j] = 0;
+}
+
 static int task_spawn(void (*fn)(void), const char *name) {
     for (int i = 1; i < MAX_TASKS; i++) {
         if (tasks[i].state != 0) continue;
@@ -199,8 +330,7 @@ static int task_spawn(void (*fn)(void), const char *name) {
         for (int r = 0; r < 8; r++) *--sp = 0;  /* pusha frame */
         tasks[i].esp = (uint32_t)sp;
         tasks[i].entry = fn;
-        int j = 0; while (name[j] && j < 11) { tasks[i].name[j] = name[j]; j++; }
-        tasks[i].name[j] = 0;
+        set_name(tasks[i].name, name, sizeof(tasks[i].name));
         tasks[i].state = 1;
         return i;
     }
@@ -279,43 +409,74 @@ static void readline(char *buf, int max) {
 }
 
 static void cmd_help(void) {
-    puts("Commands:\n"
-         "  help          show this help\n"
-         "  clear         clear the screen\n"
-         "  echo <text>   print text\n"
-         "  uptime        seconds since boot\n"
-         "  spawn         start a background counter task\n"
-         "  ps            list tasks\n"
-         "  kill <id>     stop a task\n"
-         "  reboot        restart the machine\n"
-         "  halt          stop the CPU\n");
+    puts("General:\n"
+         "  help            show this help\n"
+         "  ver             show version\n"
+         "  clear           clear the screen\n"
+         "  echo <text>     print text\n"
+         "  uptime          seconds since boot\n"
+         "  mem             heap usage\n"
+         "  reboot / halt   restart or stop the machine\n"
+         "Tasks:\n"
+         "  spawn           start a background counter task\n"
+         "  ps              list tasks\n"
+         "  kill <id>       stop a task\n"
+         "Files (kept in RAM):\n"
+         "  ls              list files\n"
+         "  write <f> <txt> create or overwrite a file\n"
+         "  cat <f>         show a file\n"
+         "  rm <f>          delete a file\n");
+}
+
+static void cmd_write(char *arg) {
+    char *name = arg;
+    char *text = arg;
+    while (*text && *text != ' ') text++;
+    if (*text) { *text++ = 0; while (*text == ' ') text++; }
+    if (*name == 0) { puts("usage: write <file> <text>\n"); return; }
+    int r = fs_write(name, text);
+    if (r == -1) puts("bad file name (max 15 chars)\n");
+    else if (r == -2) puts("too many files\n");
+    else if (r == -3) puts("out of memory\n");
+    else puts("ok\n");
 }
 
 static void shell(void) {
     char line[80];
     puts("Type 'help' for a list of commands.\n");
     for (;;) {
-        color = 0x0A; puts("minios> "); color = 0x0F;
+        color = 0x0A; puts("basicos> "); color = 0x0F;
         readline(line, sizeof(line));
         if (line[0] == 0) continue;
 
-        if (!strcmp(line, "help")) cmd_help();
-        else if (!strcmp(line, "clear")) clear_screen();
-        else if (!strncmp(line, "echo ", 5)) { puts(line + 5); putc('\n'); }
-        else if (!strcmp(line, "uptime")) { put_uint(ticks / TIMER_HZ); puts(" s\n"); }
-        else if (!strcmp(line, "spawn")) {
+        char *cmd = line, *arg = line;
+        while (*arg && *arg != ' ') arg++;
+        if (*arg) { *arg++ = 0; while (*arg == ' ') arg++; }
+
+        if (!strcmp(cmd, "help")) cmd_help();
+        else if (!strcmp(cmd, "ver")) puts(OS_NAME " v" OS_VERSION "\n");
+        else if (!strcmp(cmd, "clear")) clear_screen();
+        else if (!strcmp(cmd, "echo")) { puts(arg); putc('\n'); }
+        else if (!strcmp(cmd, "uptime")) { put_uint(ticks / TIMER_HZ); puts(" s\n"); }
+        else if (!strcmp(cmd, "mem")) {
+            uint32_t used, freeb;
+            heap_stats(&used, &freeb);
+            puts("heap used: "); put_uint(used); puts(" bytes, free: ");
+            put_uint(freeb); puts(" bytes\n");
+        }
+        else if (!strcmp(cmd, "spawn")) {
             int id = task_spawn(worker, "counter");
             if (id < 0) puts("no free task slots\n");
             else { puts("started task "); put_uint(id); putc('\n'); }
         }
-        else if (!strcmp(line, "ps")) {
+        else if (!strcmp(cmd, "ps")) {
             for (int i = 0; i < MAX_TASKS; i++) {
                 if (!tasks[i].state) continue;
                 put_uint(i); puts("  "); puts(tasks[i].name); putc('\n');
             }
         }
-        else if (!strncmp(line, "kill ", 5)) {
-            int id = atoi(line + 5);
+        else if (!strcmp(cmd, "kill")) {
+            int id = atoi(arg);
             if (id <= 0 || id >= MAX_TASKS || !tasks[id].state) puts("no such task\n");
             else {
                 tasks[id].state = 0;
@@ -324,17 +485,37 @@ static void shell(void) {
                 puts("killed\n");
             }
         }
-        else if (!strcmp(line, "reboot")) {
+        else if (!strcmp(cmd, "ls")) {
+            int count = 0;
+            for (int i = 0; i < MAX_FILES; i++) {
+                if (!files[i].used) continue;
+                puts(files[i].name);
+                for (size_t k = strlen(files[i].name); k < NAME_LEN + 1; k++) putc(' ');
+                put_uint(files[i].size); puts(" bytes\n");
+                count++;
+            }
+            if (!count) puts("(no files)\n");
+        }
+        else if (!strcmp(cmd, "write")) cmd_write(arg);
+        else if (!strcmp(cmd, "cat")) {
+            file_t *f = fs_find(arg);
+            if (!f) puts("no such file\n");
+            else { puts(f->data); putc('\n'); }
+        }
+        else if (!strcmp(cmd, "rm")) {
+            if (fs_remove(arg) < 0) puts("no such file\n"); else puts("removed\n");
+        }
+        else if (!strcmp(cmd, "reboot")) {
             while (inb(0x64) & 2) ;
             outb(0x64, 0xFE);
             for (;;) __asm__ volatile("hlt");
         }
-        else if (!strcmp(line, "halt")) {
+        else if (!strcmp(cmd, "halt")) {
             puts("System halted.\n");
             __asm__ volatile("cli");
             for (;;) __asm__ volatile("hlt");
         }
-        else { puts("unknown command: "); puts(line); putc('\n'); }
+        else { puts("unknown command: "); puts(cmd); putc('\n'); }
     }
 }
 
@@ -344,17 +525,17 @@ void kmain(void) {
     idt_init();
     pic_init();
     pit_init();
+    heap_init();
 
     for (int i = 0; i < COLS; i++) vga_at(i, 0, ' ', 0x1F);
-    const char *title = " MiniOS ";
+    const char *title = " " OS_NAME " ";
     for (int i = 0; title[i]; i++) vga_at(i, 0, title[i], 0x1F);
     clear_screen();
 
-    puts("MiniOS v0.1 booted.\n\n");
+    puts(OS_NAME " v" OS_VERSION " booted.\n\n");
 
     tasks[0].state = 1;                 /* the shell is task 0 */
-    tasks[0].name[0] = 's'; tasks[0].name[1] = 'h'; tasks[0].name[2] = 'e';
-    tasks[0].name[3] = 'l'; tasks[0].name[4] = 'l'; tasks[0].name[5] = 0;
+    set_name(tasks[0].name, "shell", sizeof(tasks[0].name));
 
     __asm__ volatile("sti");
     shell();
