@@ -1,12 +1,12 @@
-/* kernel.c - BasicOS v0.2
- * VGA text, GDT/IDT, PIC/PIT, keyboard, preemptive multitasking,
- * heap allocator, in-memory filesystem, shell.
+/* kernel.c - BasicOS v0.3
+ * VGA text, GDT/IDT, PIC/PIT, keyboard (with history), preemptive multitasking,
+ * heap allocator, in-memory filesystem, RTC clock, exception diagnostics, shell.
  */
 #include <stdint.h>
 #include <stddef.h>
 
 #define OS_NAME    "BasicOS"
-#define OS_VERSION "0.2"
+#define OS_VERSION "0.3"
 
 /* ---------------------------------------------------------------- port I/O */
 static inline void outb(uint16_t p, uint8_t v) { __asm__ volatile("outb %0, %1" :: "a"(v), "Nd"(p)); }
@@ -53,6 +53,7 @@ static void utoa(uint32_t n, char *buf) {
 
 static int cx = 0, cy = 1;              /* row 0 is the status bar */
 static uint8_t color = 0x0F;
+static uint8_t text_color = 0x0F;      /* set by the "color" command */
 
 static void vga_at(int x, int y, char c, uint8_t col) {
     VGA[y * COLS + x] = ((uint16_t)col << 8) | (uint8_t)c;
@@ -83,6 +84,13 @@ static void putc(char c) {
 static void puts(const char *s) { while (*s) putc(*s++); }
 
 static void put_uint(uint32_t n) { char b[12]; utoa(n, b); puts(b); }
+
+static void put_hex(uint32_t n) {
+    puts("0x");
+    for (int i = 28; i >= 0; i -= 4) putc("0123456789ABCDEF"[(n >> i) & 0xF]);
+}
+
+static void put_2(uint32_t n) { if (n < 10) putc('0'); put_uint(n); }
 
 static void clear_screen(void) {
     for (int y = 1; y < ROWS; y++)
@@ -123,7 +131,7 @@ static struct dt_ptr idtr;
 
 extern void irq0_stub(void);
 extern void irq1_stub(void);
-extern void exc_stub(void);
+extern void (*exc_table[32])(void);
 
 static void idt_set(int i, void (*h)(void)) {
     uint32_t a = (uint32_t)h;
@@ -132,7 +140,7 @@ static void idt_set(int i, void (*h)(void)) {
 }
 
 static void idt_init(void) {
-    for (int i = 0; i < 32; i++) idt_set(i, exc_stub);
+    for (int i = 0; i < 32; i++) idt_set(i, exc_table[i]);
     idt_set(32, irq0_stub);
     idt_set(33, irq1_stub);
     idtr.limit = sizeof(idt) - 1;
@@ -159,9 +167,69 @@ static void pit_init(void) {
     outb(0x40, div >> 8);
 }
 
-void exception_handler(void) {
+/* ---------------------------------------------------------------- exceptions */
+struct exc_frame {
+    uint32_t edi, esi, ebp, esp, ebx, edx, ecx, eax;    /* pusha */
+    uint32_t vector, err;
+    uint32_t eip, cs, eflags;                           /* pushed by the CPU */
+};
+
+static const char *exc_names[32] = {
+    "Divide error", "Debug", "NMI", "Breakpoint", "Overflow", "Bound range exceeded",
+    "Invalid opcode", "Device not available", "Double fault", "Coprocessor overrun",
+    "Invalid TSS", "Segment not present", "Stack fault", "General protection fault",
+    "Page fault", "Reserved", "x87 FPU error", "Alignment check", "Machine check",
+    "SIMD FP error"
+};
+
+void exception_handler(struct exc_frame *f) {
     color = 0x4F;
-    puts("\n*** CPU EXCEPTION - system halted ***");
+    puts("\n*** CPU EXCEPTION: ");
+    puts(f->vector < 32 && exc_names[f->vector] ? exc_names[f->vector] : "Reserved");
+    puts(" ***\n");
+    puts("vector "); put_uint(f->vector);
+    puts("  error "); put_hex(f->err);
+    puts("\nEIP "); put_hex(f->eip);
+    puts("  CS "); put_hex(f->cs);
+    puts("  EFLAGS "); put_hex(f->eflags);
+    puts("\nEAX "); put_hex(f->eax);
+    puts("  EBX "); put_hex(f->ebx);
+    puts("\nECX "); put_hex(f->ecx);
+    puts("  EDX "); put_hex(f->edx);
+    puts("\nSystem halted.\n");
+}
+
+/* ---------------------------------------------------------------- interrupt flag helpers */
+static uint32_t irq_save(void) {
+    uint32_t f;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(f) :: "memory");
+    return f;
+}
+
+static void irq_restore(uint32_t f) {
+    __asm__ volatile("push %0; popf" :: "r"(f) : "memory", "cc");
+}
+
+/* ---------------------------------------------------------------- RTC clock (CMOS) */
+typedef struct { uint8_t sec, min, hour, day, mon; uint16_t year; } rtc_t;
+
+static uint8_t cmos(uint8_t reg) { outb(0x70, reg); return inb(0x71); }
+
+#define BCD(x) ((uint8_t)(((x) & 0x0F) + ((x) >> 4) * 10))
+
+static void rtc_read(rtc_t *t) {
+    /* the index/data ports are shared, so no task switch may happen in between */
+    uint32_t fl = irq_save();
+    for (int i = 0; i < 100000 && (cmos(0x0A) & 0x80); i++) ;
+    uint8_t s = cmos(0x00), m = cmos(0x02), h = cmos(0x04);
+    uint8_t d = cmos(0x07), mo = cmos(0x08), y = cmos(0x09), b = cmos(0x0B);
+    irq_restore(fl);
+
+    int pm = h & 0x80;
+    h &= 0x7F;
+    if (!(b & 4)) { s = BCD(s); m = BCD(m); h = BCD(h); d = BCD(d); mo = BCD(mo); y = BCD(y); }
+    if (!(b & 2)) h = pm ? (h % 12) + 12 : h % 12;      /* 12-hour mode */
+    t->sec = s; t->min = m; t->hour = h; t->day = d; t->mon = mo; t->year = 2000 + y;
 }
 
 /* ---------------------------------------------------------------- heap allocator
@@ -284,6 +352,7 @@ typedef struct {
     int state;                  /* 0 = free, 1 = ready */
     void (*entry)(void);
     char name[12];
+    int sx, sw;                 /* status-bar cells owned by the task (sx < 0: none) */
 } task_t;
 
 static task_t tasks[MAX_TASKS];
@@ -331,6 +400,8 @@ static int task_spawn(void (*fn)(void), const char *name) {
         tasks[i].esp = (uint32_t)sp;
         tasks[i].entry = fn;
         set_name(tasks[i].name, name, sizeof(tasks[i].name));
+        tasks[i].sx = -1;
+        tasks[i].sw = 0;
         tasks[i].state = 1;
         return i;
     }
@@ -340,7 +411,8 @@ static int task_spawn(void (*fn)(void), const char *name) {
 /* demo worker: shows a per-task counter in the status bar (row 0) */
 static void worker(void) {
     int id = cur;
-    int x = 12 + (id - 1) * 9;
+    int x = 10 + (id - 1) * 9;
+    tasks[id].sx = x; tasks[id].sw = 8;
     uint32_t n = 0, last = ticks;
     for (;;) {
         if (ticks != last) {
@@ -352,6 +424,24 @@ static void worker(void) {
             int k = 0;
             for (; buf[k] && k < 5; k++) vga_at(x + 3 + k, 0, buf[k], 0x1E);
             for (; k < 5; k++) vga_at(x + 3 + k, 0, ' ', 0x1E);
+        }
+        __asm__ volatile("hlt");
+    }
+}
+
+/* clock: shows HH:MM:SS at the right end of the status bar */
+static void clock_task(void) {
+    tasks[cur].sx = 72; tasks[cur].sw = 8;
+    uint32_t last = (uint32_t)-1;
+    for (;;) {
+        uint32_t sec = ticks / TIMER_HZ;
+        if (sec != last) {
+            last = sec;
+            rtc_t t; rtc_read(&t);
+            char s[8] = { '0' + t.hour / 10, '0' + t.hour % 10, ':',
+                          '0' + t.min / 10,  '0' + t.min % 10,  ':',
+                          '0' + t.sec / 10,  '0' + t.sec % 10 };
+            for (int k = 0; k < 8; k++) vga_at(72 + k, 0, s[k], 0x1F);
         }
         __asm__ volatile("hlt");
     }
@@ -372,50 +462,92 @@ static const char kms[128] = {
 };
 
 #define KBUF 128
-static volatile char kbuf[KBUF];
+#define KEY_UP   0x80
+#define KEY_DOWN 0x81
+static volatile uint8_t kbuf[KBUF];
 static volatile int kb_head = 0, kb_tail = 0;
-static int shift = 0;
+static int shift = 0, ext = 0;
+
+static void kb_push(uint8_t c) {
+    int next = (kb_head + 1) % KBUF;
+    if (next != kb_tail) { kbuf[kb_head] = c; kb_head = next; }
+}
 
 void keyboard_handler(void) {
     uint8_t sc = inb(0x60);
-    if (sc == 0x2A || sc == 0x36) shift = 1;
+    if (sc == 0xE0) { ext = 1; }                        /* extended-key prefix */
+    else if (ext) {
+        ext = 0;
+        if (sc == 0x48) kb_push(KEY_UP);
+        else if (sc == 0x50) kb_push(KEY_DOWN);
+    }
+    else if (sc == 0x2A || sc == 0x36) shift = 1;
     else if (sc == 0xAA || sc == 0xB6) shift = 0;
     else if (sc < 58) {
         char c = shift ? kms[sc] : km[sc];
-        if (c) {
-            int next = (kb_head + 1) % KBUF;
-            if (next != kb_tail) { kbuf[kb_head] = c; kb_head = next; }
-        }
+        if (c) kb_push((uint8_t)c);
     }
     outb(0x20, 0x20);           /* EOI */
 }
 
-static char getchar(void) {
+static uint8_t getchar(void) {
     while (kb_head == kb_tail) __asm__ volatile("hlt");
-    char c = kbuf[kb_tail];
+    uint8_t c = kbuf[kb_tail];
     kb_tail = (kb_tail + 1) % KBUF;
     return c;
 }
 
+/* ---------------------------------------------------------------- boot info */
+struct mb_info { uint32_t flags, mem_lower, mem_upper; };
+static uint32_t ram_mb = 0;
+
 /* ---------------------------------------------------------------- shell */
+#define HIST_N 8
+static char hist[HIST_N][80];
+static int hist_count = 0;
+
+static void hist_add(const char *line) {
+    if (!line[0]) return;
+    if (hist_count > 0 && !strcmp(hist[(hist_count - 1) % HIST_N], line)) return;
+    char *dst = hist[hist_count % HIST_N];
+    int i = 0;
+    while (line[i] && i < 79) { dst[i] = line[i]; i++; }
+    dst[i] = 0;
+    hist_count++;
+}
+
 static void readline(char *buf, int max) {
     int len = 0;
+    int pos = hist_count;                               /* history cursor */
     for (;;) {
-        char c = getchar();
+        uint8_t c = getchar();
         if (c == '\n') { putc('\n'); buf[len] = 0; return; }
+        if (c == KEY_UP || c == KEY_DOWN) {
+            if (c == KEY_UP && pos > 0 && pos > hist_count - HIST_N) pos--;
+            else if (c == KEY_DOWN && pos < hist_count) pos++;
+            else continue;
+            while (len > 0) { len--; putc('\b'); }      /* erase current input */
+            if (pos < hist_count) {
+                const char *h = hist[pos % HIST_N];
+                while (h[len] && len < max - 1) { buf[len] = h[len]; putc(h[len]); len++; }
+            }
+            continue;
+        }
         if (c == '\b') { if (len > 0) { len--; putc('\b'); } }
-        else if (c >= 32 && len < max - 1) { buf[len++] = c; putc(c); }
+        else if (c >= 32 && c < 127 && len < max - 1) { buf[len++] = c; putc(c); }
     }
 }
 
 static void cmd_help(void) {
-    puts("General:\n"
+    puts("General (up/down arrows: history):\n"
          "  help            show this help\n"
          "  ver             show version\n"
          "  clear           clear the screen\n"
          "  echo <text>     print text\n"
          "  uptime          seconds since boot\n"
-         "  mem             heap usage\n"
+         "  mem             RAM size and heap usage\n"
+         "  date            current date and time (RTC)\n"
+         "  color <1-15>    set text color\n"
          "  reboot / halt   restart or stop the machine\n"
          "Tasks:\n"
          "  spawn           start a background counter task\n"
@@ -445,9 +577,10 @@ static void shell(void) {
     char line[80];
     puts("Type 'help' for a list of commands.\n");
     for (;;) {
-        color = 0x0A; puts("basicos> "); color = 0x0F;
+        color = 0x0A; puts("basicos> "); color = text_color;
         readline(line, sizeof(line));
         if (line[0] == 0) continue;
+        hist_add(line);
 
         char *cmd = line, *arg = line;
         while (*arg && *arg != ' ') arg++;
@@ -461,8 +594,20 @@ static void shell(void) {
         else if (!strcmp(cmd, "mem")) {
             uint32_t used, freeb;
             heap_stats(&used, &freeb);
+            if (ram_mb) { puts("RAM: "); put_uint(ram_mb); puts(" MB\n"); }
             puts("heap used: "); put_uint(used); puts(" bytes, free: ");
             put_uint(freeb); puts(" bytes\n");
+        }
+        else if (!strcmp(cmd, "date")) {
+            rtc_t t; rtc_read(&t);
+            put_uint(t.year); putc('-'); put_2(t.mon); putc('-'); put_2(t.day); putc(' ');
+            put_2(t.hour); putc(':'); put_2(t.min); putc(':'); put_2(t.sec);
+            puts("  (RTC, often UTC)\n");
+        }
+        else if (!strcmp(cmd, "color")) {
+            int c = atoi(arg);
+            if (c < 1 || c > 15) puts("usage: color <1-15>\n");
+            else { text_color = (uint8_t)c; color = text_color; puts("ok\n"); }
         }
         else if (!strcmp(cmd, "spawn")) {
             int id = task_spawn(worker, "counter");
@@ -480,8 +625,8 @@ static void shell(void) {
             if (id <= 0 || id >= MAX_TASKS || !tasks[id].state) puts("no such task\n");
             else {
                 tasks[id].state = 0;
-                int x = 12 + (id - 1) * 9;
-                for (int k = 0; k < 8; k++) vga_at(x + k, 0, ' ', 0x1F);
+                if (tasks[id].sx >= 0)
+                    for (int k = 0; k < tasks[id].sw; k++) vga_at(tasks[id].sx + k, 0, ' ', 0x1F);
                 puts("killed\n");
             }
         }
@@ -520,7 +665,9 @@ static void shell(void) {
 }
 
 /* ---------------------------------------------------------------- entry */
-void kmain(void) {
+void kmain(uint32_t magic, struct mb_info *mbi) {
+    if (magic == 0x2BADB002 && (mbi->flags & 1)) ram_mb = mbi->mem_upper / 1024 + 1;
+
     gdt_init();
     idt_init();
     pic_init();
@@ -536,6 +683,8 @@ void kmain(void) {
 
     tasks[0].state = 1;                 /* the shell is task 0 */
     set_name(tasks[0].name, "shell", sizeof(tasks[0].name));
+    tasks[0].sx = -1;
+    task_spawn(clock_task, "clock");
 
     __asm__ volatile("sti");
     shell();
