@@ -1,12 +1,13 @@
-/* kernel.c - BasicOS v0.3
- * VGA text, GDT/IDT, PIC/PIT, keyboard (with history), preemptive multitasking,
- * heap allocator, in-memory filesystem, RTC clock, exception diagnostics, shell.
+/* kernel.c - BasicOS v0.4
+ * VGA text + serial log, GDT/IDT, PIC/PIT, paging (NULL guard, read-only code),
+ * keyboard (with history), preemptive multitasking with sleep, heap allocator,
+ * in-memory filesystem, RTC clock, exception diagnostics, shell.
  */
 #include <stdint.h>
 #include <stddef.h>
 
 #define OS_NAME    "BasicOS"
-#define OS_VERSION "0.3"
+#define OS_VERSION "0.4"
 
 /* ---------------------------------------------------------------- port I/O */
 static inline void outb(uint16_t p, uint8_t v) { __asm__ volatile("outb %0, %1" :: "a"(v), "Nd"(p)); }
@@ -71,7 +72,40 @@ static void scroll(void) {
     cy = ROWS - 1;
 }
 
+/* ---------------------------------------------------------------- serial (COM1) log
+ * Everything printed on screen is mirrored to COM1 (QEMU: -serial stdio).
+ * The port is probed with a loopback test, so machines without one stay fast.
+ */
+static int serial_ok = 0;
+
+static void serial_init(void) {
+    outb(0x3F9, 0x00);                  /* no interrupts */
+    outb(0x3FB, 0x80);                  /* DLAB on */
+    outb(0x3F8, 0x03); outb(0x3F9, 0x00);   /* 38400 baud */
+    outb(0x3FB, 0x03);                  /* 8N1 */
+    outb(0x3FA, 0xC7);                  /* FIFO */
+    outb(0x3FC, 0x1E);                  /* loopback mode */
+    outb(0x3F8, 0xAE);
+    if (inb(0x3F8) != 0xAE) return;     /* no UART here */
+    outb(0x3FC, 0x0F);                  /* normal operation */
+    serial_ok = 1;
+}
+
+static void serial_put(char c) {
+    for (int i = 0; i < 20000 && !(inb(0x3FD) & 0x20); i++) ;
+    outb(0x3F8, (uint8_t)c);
+}
+
+static void serial_mirror(char c) {
+    if (!serial_ok) return;
+    if (c == '\n') { serial_put('\r'); serial_put('\n'); }
+    else if (c == '\b') { serial_put('\b'); serial_put(' '); serial_put('\b'); }
+    else if (c == '\t') serial_put(' ');
+    else serial_put(c);
+}
+
 static void putc(char c) {
+    serial_mirror(c);
     if (c == '\n') { cx = 0; cy++; }
     else if (c == '\b') { if (cx > 0) { cx--; vga_at(cx, cy, ' ', color); } }
     else if (c == '\t') { cx = (cx + 4) & ~3; }
@@ -189,6 +223,13 @@ void exception_handler(struct exc_frame *f) {
     puts(" ***\n");
     puts("vector "); put_uint(f->vector);
     puts("  error "); put_hex(f->err);
+    if (f->vector == 14) {
+        uint32_t cr2;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        puts("\nfaulting address "); put_hex(cr2);
+        puts((f->err & 1) ? " (protection violation, " : " (page not present, ");
+        puts((f->err & 2) ? "write)" : "read)");
+    }
     puts("\nEIP "); put_hex(f->eip);
     puts("  CS "); put_hex(f->cs);
     puts("  EFLAGS "); put_hex(f->eflags);
@@ -292,6 +333,38 @@ static void heap_stats(uint32_t *used, uint32_t *freeb) {
     }
 }
 
+/* ---------------------------------------------------------------- paging
+ * Identity-maps the first 16 MB with 4 KB pages. Page 0 is left unmapped, so a
+ * NULL dereference faults; kernel code and read-only data are mapped read-only
+ * (CR0.WP makes that apply to the kernel itself).
+ */
+#define PAGE_SIZE   4096
+#define MAP_TABLES  4                           /* 4 x 4 MB = 16 MB */
+
+extern char __ro_end[];                         /* from linker.ld */
+
+static uint32_t page_dir[1024] __attribute__((aligned(4096)));
+static uint32_t page_tables[MAP_TABLES][1024] __attribute__((aligned(4096)));
+
+static void paging_init(void) {
+    uint32_t ro_end = (uint32_t)__ro_end;
+    for (int t = 0; t < MAP_TABLES; t++) {
+        for (int i = 0; i < 1024; i++) {
+            uint32_t addr = ((uint32_t)t * 1024 + i) * PAGE_SIZE;
+            uint32_t flags = 3;                 /* present + writable */
+            if (addr == 0) { page_tables[t][i] = 0; continue; }
+            if (addr >= 0x100000 && addr < ro_end) flags = 1;   /* present, read-only */
+            page_tables[t][i] = addr | flags;
+        }
+        page_dir[t] = (uint32_t)page_tables[t] | 3;
+    }
+    __asm__ volatile("mov %0, %%cr3" :: "r"(page_dir));
+    uint32_t cr0;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+    cr0 |= 0x80010000u;                         /* PG + WP */
+    __asm__ volatile("mov %0, %%cr0" :: "r"(cr0) : "memory");
+}
+
 /* ---------------------------------------------------------------- RAM filesystem */
 #define MAX_FILES 16
 #define NAME_LEN  16
@@ -343,16 +416,59 @@ static int fs_remove(const char *name) {
     return 0;
 }
 
+static int fs_append(const char *name, const char *text) {
+    file_t *f = fs_find(name);
+    if (!f) return fs_write(name, text);
+    uint32_t add = strlen(text);
+    char *buf = kmalloc(f->size + add + 1);
+    if (!buf) return -3;
+    memcpy(buf, f->data, f->size);
+    memcpy(buf + f->size, text, add + 1);
+    kfree(f->data);
+    f->data = buf;
+    f->size += add;
+    return 0;
+}
+
+static int fs_copy(const char *src, const char *dst) {
+    file_t *f = fs_find(src);
+    if (!f) return -4;
+    return fs_write(dst, f->data);
+}
+
+static int fs_rename(const char *from, const char *to) {
+    file_t *f = fs_find(from);
+    if (!f) return -4;
+    size_t n = strlen(to);
+    if (n == 0 || n >= NAME_LEN) return -1;
+    file_t *g = fs_find(to);
+    if (g && g != f) return -5;
+    memcpy(f->name, to, n + 1);
+    return 0;
+}
+
+static void fs_err(int r) {
+    switch (r) {
+    case -1: puts("bad file name (max 15 chars)\n"); break;
+    case -2: puts("too many files\n"); break;
+    case -3: puts("out of memory\n"); break;
+    case -4: puts("no such file\n"); break;
+    case -5: puts("target already exists\n"); break;
+    default: puts("ok\n");
+    }
+}
+
 /* ---------------------------------------------------------------- multitasking */
 #define MAX_TASKS 8
 #define STACK_SZ  4096
 
 typedef struct {
     uint32_t esp;
-    int state;                  /* 0 = free, 1 = ready */
+    int state;                  /* 0 = free, 1 = ready, 2 = sleeping */
     void (*entry)(void);
     char name[12];
     int sx, sw;                 /* status-bar cells owned by the task (sx < 0: none) */
+    uint32_t wake;              /* tick at which a sleeping task becomes ready */
 } task_t;
 
 static task_t tasks[MAX_TASKS];
@@ -363,6 +479,8 @@ static volatile int cur = 0;
 uint32_t timer_handler(uint32_t esp) {
     ticks++;
     tasks[cur].esp = esp;
+    for (int i = 0; i < MAX_TASKS; i++)
+        if (tasks[i].state == 2 && (int32_t)(ticks - tasks[i].wake) >= 0) tasks[i].state = 1;
     int n = cur;
     for (int k = 0; k < MAX_TASKS; k++) {
         n = (n + 1) % MAX_TASKS;
@@ -408,6 +526,16 @@ static int task_spawn(void (*fn)(void), const char *name) {
     return -1;
 }
 
+/* block the calling task for at least `ms` milliseconds; other tasks keep running */
+static void task_sleep(uint32_t ms) {
+    int me = cur;
+    uint32_t t = ms * TIMER_HZ / 1000;
+    if (t == 0) t = 1;
+    tasks[me].wake = ticks + t;
+    tasks[me].state = 2;
+    while (tasks[me].state == 2) __asm__ volatile("hlt");
+}
+
 /* demo worker: shows a per-task counter in the status bar (row 0) */
 static void worker(void) {
     int id = cur;
@@ -443,7 +571,7 @@ static void clock_task(void) {
                           '0' + t.sec / 10,  '0' + t.sec % 10 };
             for (int k = 0; k < 8; k++) vga_at(72 + k, 0, s[k], 0x1F);
         }
-        __asm__ volatile("hlt");
+        task_sleep(250);
     }
 }
 
@@ -540,37 +668,27 @@ static void readline(char *buf, int max) {
 
 static void cmd_help(void) {
     puts("General (up/down arrows: history):\n"
-         "  help            show this help\n"
-         "  ver             show version\n"
-         "  clear           clear the screen\n"
-         "  echo <text>     print text\n"
-         "  uptime          seconds since boot\n"
-         "  mem             RAM size and heap usage\n"
-         "  date            current date and time (RTC)\n"
-         "  color <1-15>    set text color\n"
-         "  reboot / halt   restart or stop the machine\n"
+         "  help, ver, clear, uptime, date, mem, history, reboot, halt\n"
+         "  echo <text>         print text\n"
+         "  color <1-15>        set text color\n"
+         "  sleep <seconds>     pause the shell (other tasks keep running)\n"
          "Tasks:\n"
-         "  spawn           start a background counter task\n"
-         "  ps              list tasks\n"
-         "  kill <id>       stop a task\n"
+         "  spawn, ps, kill <id>\n"
          "Files (kept in RAM):\n"
-         "  ls              list files\n"
-         "  write <f> <txt> create or overwrite a file\n"
-         "  cat <f>         show a file\n"
-         "  rm <f>          delete a file\n");
+         "  ls, cat <f>, rm <f>\n"
+         "  write <f> <text>    create or overwrite\n"
+         "  append <f> <text>   add to the end of a file\n"
+         "  cp <src> <dst>, mv <old> <new>\n"
+         "Debug:\n"
+         "  crash <null|code|div|ud>   trigger a CPU exception on purpose\n");
 }
 
-static void cmd_write(char *arg) {
-    char *name = arg;
-    char *text = arg;
-    while (*text && *text != ' ') text++;
-    if (*text) { *text++ = 0; while (*text == ' ') text++; }
-    if (*name == 0) { puts("usage: write <file> <text>\n"); return; }
-    int r = fs_write(name, text);
-    if (r == -1) puts("bad file name (max 15 chars)\n");
-    else if (r == -2) puts("too many files\n");
-    else if (r == -3) puts("out of memory\n");
-    else puts("ok\n");
+/* splits "first rest" in place; returns the trimmed rest */
+static char *split2(char *arg) {
+    char *rest = arg;
+    while (*rest && *rest != ' ') rest++;
+    if (*rest) { *rest++ = 0; while (*rest == ' ') rest++; }
+    return rest;
 }
 
 static void shell(void) {
@@ -597,6 +715,7 @@ static void shell(void) {
             if (ram_mb) { puts("RAM: "); put_uint(ram_mb); puts(" MB\n"); }
             puts("heap used: "); put_uint(used); puts(" bytes, free: ");
             put_uint(freeb); puts(" bytes\n");
+            puts("paging: on (first 16 MB mapped, kernel code read-only)\n");
         }
         else if (!strcmp(cmd, "date")) {
             rtc_t t; rtc_read(&t);
@@ -617,7 +736,10 @@ static void shell(void) {
         else if (!strcmp(cmd, "ps")) {
             for (int i = 0; i < MAX_TASKS; i++) {
                 if (!tasks[i].state) continue;
-                put_uint(i); puts("  "); puts(tasks[i].name); putc('\n');
+                put_uint(i); puts("  "); puts(tasks[i].name);
+                for (size_t k = strlen(tasks[i].name); k < 10; k++) putc(' ');
+                puts(i == cur ? "running" : tasks[i].state == 2 ? "sleeping" : "ready");
+                putc('\n');
             }
         }
         else if (!strcmp(cmd, "kill")) {
@@ -641,7 +763,22 @@ static void shell(void) {
             }
             if (!count) puts("(no files)\n");
         }
-        else if (!strcmp(cmd, "write")) cmd_write(arg);
+        else if (!strcmp(cmd, "write")) {
+            char *text = split2(arg);
+            if (*arg == 0) puts("usage: write <file> <text>\n"); else fs_err(fs_write(arg, text));
+        }
+        else if (!strcmp(cmd, "append")) {
+            char *text = split2(arg);
+            if (*arg == 0) puts("usage: append <file> <text>\n"); else fs_err(fs_append(arg, text));
+        }
+        else if (!strcmp(cmd, "cp")) {
+            char *dst = split2(arg);
+            if (*arg == 0 || *dst == 0) puts("usage: cp <src> <dst>\n"); else fs_err(fs_copy(arg, dst));
+        }
+        else if (!strcmp(cmd, "mv")) {
+            char *dst = split2(arg);
+            if (*arg == 0 || *dst == 0) puts("usage: mv <old> <new>\n"); else fs_err(fs_rename(arg, dst));
+        }
         else if (!strcmp(cmd, "cat")) {
             file_t *f = fs_find(arg);
             if (!f) puts("no such file\n");
@@ -649,6 +786,24 @@ static void shell(void) {
         }
         else if (!strcmp(cmd, "rm")) {
             if (fs_remove(arg) < 0) puts("no such file\n"); else puts("removed\n");
+        }
+        else if (!strcmp(cmd, "history")) {
+            int start = hist_count > HIST_N ? hist_count - HIST_N : 0;
+            for (int i = start; i < hist_count; i++) {
+                put_uint(i + 1); puts("  "); puts(hist[i % HIST_N]); putc('\n');
+            }
+        }
+        else if (!strcmp(cmd, "sleep")) {
+            int sec = atoi(arg);
+            if (sec < 1 || sec > 3600) puts("usage: sleep <1-3600>\n");
+            else task_sleep((uint32_t)sec * 1000);
+        }
+        else if (!strcmp(cmd, "crash")) {
+            if (!strcmp(arg, "null")) { volatile uint32_t *p = (volatile uint32_t *)0; *p = 1; }
+            else if (!strcmp(arg, "code")) { volatile uint8_t *p = (volatile uint8_t *)(uint32_t)timer_handler; *p = 0; }
+            else if (!strcmp(arg, "div")) { volatile int z = 0; volatile int r = 1 / z; (void)r; }
+            else if (!strcmp(arg, "ud")) __asm__ volatile("ud2");
+            else puts("usage: crash <null|code|div|ud>\n");
         }
         else if (!strcmp(cmd, "reboot")) {
             while (inb(0x64) & 2) ;
@@ -668,11 +823,13 @@ static void shell(void) {
 void kmain(uint32_t magic, struct mb_info *mbi) {
     if (magic == 0x2BADB002 && (mbi->flags & 1)) ram_mb = mbi->mem_upper / 1024 + 1;
 
+    serial_init();
     gdt_init();
     idt_init();
     pic_init();
     pit_init();
     heap_init();
+    paging_init();
 
     for (int i = 0; i < COLS; i++) vga_at(i, 0, ' ', 0x1F);
     const char *title = " " OS_NAME " ";

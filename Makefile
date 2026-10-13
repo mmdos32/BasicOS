@@ -2,6 +2,7 @@ CC      = gcc
 LD      = ld
 CFLAGS  = -m32 -std=gnu11 -O2 -Wall -Wextra -ffreestanding -fno-pic -fno-pie \
           -fno-stack-protector -fno-tree-loop-distribute-patterns \
+          -fno-asynchronous-unwind-tables -fcf-protection=none \
           -mno-sse -mno-mmx -nostdlib
 LDFLAGS = -m elf_i386 -T linker.ld -z noexecstack
 
@@ -24,6 +25,10 @@ basicos.iso: kernel.elf
 
 run: kernel.elf
 	qemu-system-i386 -display gtk -kernel kernel.elf
+
+# also mirrors all output to this terminal through the serial port
+run-serial: kernel.elf
+	qemu-system-i386 -display gtk -serial stdio -kernel kernel.elf
 
 run-iso: basicos.iso
 	qemu-system-i386 -display gtk -cdrom basicos.iso
