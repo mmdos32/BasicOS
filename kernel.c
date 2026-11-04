@@ -1,4 +1,4 @@
-/* kernel.c - BasicOS v0.4
+/* kernel.c - BasicOS v0.5 (bug-fix release)
  * VGA text + serial log, GDT/IDT, PIC/PIT, paging (NULL guard, read-only code),
  * keyboard (with history), preemptive multitasking with sleep, heap allocator,
  * in-memory filesystem, RTC clock, exception diagnostics, shell.
@@ -7,11 +7,18 @@
 #include <stddef.h>
 
 #define OS_NAME    "BasicOS"
-#define OS_VERSION "0.4"
+#define OS_VERSION "0.5"
 
 /* ---------------------------------------------------------------- port I/O */
 static inline void outb(uint16_t p, uint8_t v) { __asm__ volatile("outb %0, %1" :: "a"(v), "Nd"(p)); }
 static inline uint8_t inb(uint16_t p) { uint8_t v; __asm__ volatile("inb %1, %0" : "=a"(v) : "Nd"(p)); return v; }
+
+/* hlt/cli/sti must also be compiler barriers: loops that wait for something an
+ * interrupt handler changes would otherwise be free to cache the value in a register */
+static inline void cpu_halt(void) { __asm__ volatile("hlt" ::: "memory"); }
+static inline void cpu_cli(void)  { __asm__ volatile("cli" ::: "memory"); }
+static inline void cpu_sti(void)  { __asm__ volatile("sti" ::: "memory"); }
+static inline void io_wait(void)  { outb(0x80, 0); }      /* ~1 us delay for old PIC/PIT hardware */
 
 /* ---------------------------------------------------------------- libc bits */
 void *memcpy(void *d, const void *s, size_t n) {
@@ -26,6 +33,19 @@ void *memset(void *d, int v, size_t n) {
     return d;
 }
 
+void *memmove(void *d, const void *s, size_t n) {
+    uint8_t *dp = d; const uint8_t *sp = s;
+    if (dp < sp) { while (n--) *dp++ = *sp++; }
+    else { dp += n; sp += n; while (n--) *--dp = *--sp; }
+    return d;
+}
+
+int memcmp(const void *a, const void *b, size_t n) {
+    const uint8_t *x = a, *y = b;
+    while (n--) { if (*x != *y) return *x - *y; x++; y++; }
+    return 0;
+}
+
 static size_t strlen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
 
 static int strcmp(const char *a, const char *b) {
@@ -35,8 +55,19 @@ static int strcmp(const char *a, const char *b) {
 
 static int atoi(const char *s) {
     int n = 0;
-    while (*s >= '0' && *s <= '9') n = n * 10 + (*s++ - '0');
+    while (*s >= '0' && *s <= '9') {
+        if (n > 100000000) return 100000000;    /* clamp instead of overflowing */
+        n = n * 10 + (*s++ - '0');
+    }
     return n;
+}
+
+/* strips leading and trailing spaces in place; returns the new start of the string */
+static char *trim(char *s) {
+    while (*s == ' ') s++;
+    size_t n = strlen(s);
+    while (n > 0 && s[n - 1] == ' ') s[--n] = 0;
+    return s;
 }
 
 static void utoa(uint32_t n, char *buf) {
@@ -104,13 +135,25 @@ static void serial_mirror(char c) {
     else serial_put(c);
 }
 
+static int wrapped = 0;     /* the cursor auto-wrapped after filling the last column */
+
 static void putc(char c) {
     serial_mirror(c);
-    if (c == '\n') { cx = 0; cy++; }
-    else if (c == '\b') { if (cx > 0) { cx--; vga_at(cx, cy, ' ', color); } }
-    else if (c == '\t') { cx = (cx + 4) & ~3; }
-    else { vga_at(cx, cy, c, color); cx++; }
-    if (cx >= COLS) { cx = 0; cy++; }
+    if (c == '\n') {
+        if (wrapped) wrapped = 0;       /* already at the start of a fresh line: no blank line */
+        else { cx = 0; cy++; }
+    } else if (c == '\b') {
+        wrapped = 0;
+        if (cx > 0) { cx--; vga_at(cx, cy, ' ', color); }
+        else if (cy > 1) { cy--; cx = COLS - 1; vga_at(cx, cy, ' ', color); }   /* back over a wrap */
+    } else if (c == '\t') {
+        wrapped = 0;
+        cx = (cx + 4) & ~3;
+    } else {
+        wrapped = 0;
+        vga_at(cx, cy, c, color); cx++;
+    }
+    if (cx >= COLS) { cx = 0; cy++; if (c != '\n' && c != '\b') wrapped = 1; }
     if (cy >= ROWS) scroll();
     cursor_update();
 }
@@ -129,7 +172,7 @@ static void put_2(uint32_t n) { if (n < 10) putc('0'); put_uint(n); }
 static void clear_screen(void) {
     for (int y = 1; y < ROWS; y++)
         for (int x = 0; x < COLS; x++) vga_at(x, y, ' ', color);
-    cx = 0; cy = 1;
+    cx = 0; cy = 1; wrapped = 0;
     cursor_update();
 }
 
@@ -183,10 +226,10 @@ static void idt_init(void) {
 }
 
 static void pic_init(void) {
-    outb(0x20, 0x11); outb(0xA0, 0x11);
-    outb(0x21, 0x20); outb(0xA1, 0x28);
-    outb(0x21, 0x04); outb(0xA1, 0x02);
-    outb(0x21, 0x01); outb(0xA1, 0x01);
+    outb(0x20, 0x11); io_wait(); outb(0xA0, 0x11); io_wait();
+    outb(0x21, 0x20); io_wait(); outb(0xA1, 0x28); io_wait();
+    outb(0x21, 0x04); io_wait(); outb(0xA1, 0x02); io_wait();
+    outb(0x21, 0x01); io_wait(); outb(0xA1, 0x01); io_wait();
     outb(0x21, 0xFC);                    /* unmask IRQ0 (timer) + IRQ1 (keyboard) */
     outb(0xA1, 0xFF);
 }
@@ -297,6 +340,7 @@ static void heap_init(void) {
 }
 
 static void *kmalloc(uint32_t n) {
+    if (n > HEAP_SIZE) return NULL;     /* also keeps the rounding below from wrapping */
     n = (n + 15) & ~15u;
     if (n == 0) n = 16;
     for (block_t *b = heap_head; b; b = b->next) {
@@ -317,7 +361,11 @@ static void *kmalloc(uint32_t n) {
 
 static void kfree(void *p) {
     if (!p) return;
-    ((block_t *)p - 1)->free = 1;
+    uint8_t *q = p;
+    if (q < heap + sizeof(block_t) || q >= heap + HEAP_SIZE) return;    /* not a heap pointer */
+    block_t *b = (block_t *)p - 1;
+    if (b->free) return;                                                /* double free */
+    b->free = 1;
     for (block_t *c = heap_head; c; c = c->next) {      /* coalesce */
         while (c->free && c->next && c->next->free) {
             c->size += sizeof(block_t) + c->next->size;
@@ -458,6 +506,15 @@ static void fs_err(int r) {
     }
 }
 
+/* ---------------------------------------------------------------- panic */
+static void panic(const char *msg, int id) {
+    cpu_cli();
+    color = 0x4F;
+    puts("\n*** KERNEL PANIC: "); puts(msg);
+    puts(" (task "); put_uint((uint32_t)id); puts(") ***\nSystem halted.\n");
+    for (;;) cpu_halt();
+}
+
 /* ---------------------------------------------------------------- multitasking */
 #define MAX_TASKS 8
 #define STACK_SZ  4096
@@ -471,6 +528,9 @@ typedef struct {
     uint32_t wake;              /* tick at which a sleeping task becomes ready */
 } task_t;
 
+#define STACK_CANARY 0xDEADC0DEu
+extern char stack_bottom[];                     /* the boot stack used by the shell (boot.s) */
+
 static task_t tasks[MAX_TASKS];
 static uint8_t stacks[MAX_TASKS][STACK_SZ] __attribute__((aligned(16)));
 static volatile int cur = 0;
@@ -478,6 +538,9 @@ static volatile int cur = 0;
 /* called from irq0_stub with the interrupted task's esp; returns next task's esp */
 uint32_t timer_handler(uint32_t esp) {
     ticks++;
+    /* a stack that grew past its end would silently corrupt its neighbour: stop instead */
+    uint32_t *canary = cur == 0 ? (uint32_t *)stack_bottom : (uint32_t *)stacks[cur];
+    if (tasks[cur].state != 0 && *canary != STACK_CANARY) panic("stack overflow", cur);
     tasks[cur].esp = esp;
     for (int i = 0; i < MAX_TASKS; i++)
         if (tasks[i].state == 2 && (int32_t)(ticks - tasks[i].wake) >= 0) tasks[i].state = 1;
@@ -493,7 +556,7 @@ uint32_t timer_handler(uint32_t esp) {
 
 static void task_exit(void) {
     tasks[cur].state = 0;
-    for (;;) __asm__ volatile("hlt");
+    for (;;) cpu_halt();
 }
 
 static void task_main(void) {
@@ -515,6 +578,7 @@ static int task_spawn(void (*fn)(void), const char *name) {
         *--sp = 0x08;                       /* cs */
         *--sp = (uint32_t)task_main;        /* eip */
         for (int r = 0; r < 8; r++) *--sp = 0;  /* pusha frame */
+        *(uint32_t *)stacks[i] = STACK_CANARY;
         tasks[i].esp = (uint32_t)sp;
         tasks[i].entry = fn;
         set_name(tasks[i].name, name, sizeof(tasks[i].name));
@@ -533,7 +597,7 @@ static void task_sleep(uint32_t ms) {
     if (t == 0) t = 1;
     tasks[me].wake = ticks + t;
     tasks[me].state = 2;
-    while (tasks[me].state == 2) __asm__ volatile("hlt");
+    while (tasks[me].state == 2) cpu_halt();
 }
 
 /* demo worker: shows a per-task counter in the status bar (row 0) */
@@ -553,7 +617,7 @@ static void worker(void) {
             for (; buf[k] && k < 5; k++) vga_at(x + 3 + k, 0, buf[k], 0x1E);
             for (; k < 5; k++) vga_at(x + 3 + k, 0, ' ', 0x1E);
         }
-        __asm__ volatile("hlt");
+        cpu_halt();
     }
 }
 
@@ -594,7 +658,7 @@ static const char kms[128] = {
 #define KEY_DOWN 0x81
 static volatile uint8_t kbuf[KBUF];
 static volatile int kb_head = 0, kb_tail = 0;
-static int shift = 0, ext = 0;
+static int lshift = 0, rshift = 0, ext = 0;
 
 static void kb_push(uint8_t c) {
     int next = (kb_head + 1) % KBUF;
@@ -609,17 +673,25 @@ void keyboard_handler(void) {
         if (sc == 0x48) kb_push(KEY_UP);
         else if (sc == 0x50) kb_push(KEY_DOWN);
     }
-    else if (sc == 0x2A || sc == 0x36) shift = 1;
-    else if (sc == 0xAA || sc == 0xB6) shift = 0;
+    else if (sc == 0x2A) lshift = 1;
+    else if (sc == 0xAA) lshift = 0;
+    else if (sc == 0x36) rshift = 1;
+    else if (sc == 0xB6) rshift = 0;
     else if (sc < 58) {
-        char c = shift ? kms[sc] : km[sc];
+        char c = (lshift || rshift) ? kms[sc] : km[sc];
         if (c) kb_push((uint8_t)c);
     }
     outb(0x20, 0x20);           /* EOI */
 }
 
+/* a byte left in the 8042 output buffer (e.g. by the bootloader) blocks further
+ * keyboard interrupts until it is read, so empty it before enabling IRQ1 */
+static void kbd_init(void) {
+    for (int i = 0; i < 64 && (inb(0x64) & 1); i++) { inb(0x60); io_wait(); }
+}
+
 static uint8_t getchar(void) {
-    while (kb_head == kb_tail) __asm__ volatile("hlt");
+    while (kb_head == kb_tail) cpu_halt();
     uint8_t c = kbuf[kb_tail];
     kb_tail = (kb_tail + 1) % KBUF;
     return c;
@@ -628,6 +700,17 @@ static uint8_t getchar(void) {
 /* ---------------------------------------------------------------- boot info */
 struct mb_info { uint32_t flags, mem_lower, mem_upper; };
 static uint32_t ram_mb = 0;
+
+/* ---------------------------------------------------------------- reboot */
+static void reboot(void) {
+    cpu_cli();
+    for (int i = 0; i < 100000 && (inb(0x64) & 2); i++) ;   /* wait for the 8042, but not forever */
+    outb(0x64, 0xFE);                                       /* pulse the CPU reset line */
+    for (volatile int i = 0; i < 1000000; i++) ;
+    struct dt_ptr empty = { 0, 0 };                         /* fallback: fault with no IDT -> triple fault */
+    __asm__ volatile("lidt (%0)\n ud2" :: "r"(&empty));
+    for (;;) cpu_halt();
+}
 
 /* ---------------------------------------------------------------- shell */
 #define HIST_N 8
@@ -697,10 +780,11 @@ static void shell(void) {
     for (;;) {
         color = 0x0A; puts("basicos> "); color = text_color;
         readline(line, sizeof(line));
-        if (line[0] == 0) continue;
-        hist_add(line);
+        char *start = trim(line);
+        if (start[0] == 0) continue;
+        hist_add(start);
 
-        char *cmd = line, *arg = line;
+        char *cmd = start, *arg = start;
         while (*arg && *arg != ' ') arg++;
         if (*arg) { *arg++ = 0; while (*arg == ' ') arg++; }
 
@@ -805,15 +889,11 @@ static void shell(void) {
             else if (!strcmp(arg, "ud")) __asm__ volatile("ud2");
             else puts("usage: crash <null|code|div|ud>\n");
         }
-        else if (!strcmp(cmd, "reboot")) {
-            while (inb(0x64) & 2) ;
-            outb(0x64, 0xFE);
-            for (;;) __asm__ volatile("hlt");
-        }
+        else if (!strcmp(cmd, "reboot")) reboot();
         else if (!strcmp(cmd, "halt")) {
             puts("System halted.\n");
-            __asm__ volatile("cli");
-            for (;;) __asm__ volatile("hlt");
+            cpu_cli();
+            for (;;) cpu_halt();
         }
         else { puts("unknown command: "); puts(cmd); putc('\n'); }
     }
@@ -828,6 +908,7 @@ void kmain(uint32_t magic, struct mb_info *mbi) {
     idt_init();
     pic_init();
     pit_init();
+    kbd_init();
     heap_init();
     paging_init();
 
@@ -838,11 +919,12 @@ void kmain(uint32_t magic, struct mb_info *mbi) {
 
     puts(OS_NAME " v" OS_VERSION " booted.\n\n");
 
+    *(uint32_t *)stack_bottom = STACK_CANARY;
     tasks[0].state = 1;                 /* the shell is task 0 */
     set_name(tasks[0].name, "shell", sizeof(tasks[0].name));
     tasks[0].sx = -1;
     task_spawn(clock_task, "clock");
 
-    __asm__ volatile("sti");
+    cpu_sti();
     shell();
 }

@@ -11,6 +11,7 @@
 
 .section .bss
 .align 16
+.global stack_bottom
 stack_bottom:
     .skip 16384
 stack_top:
@@ -19,6 +20,7 @@ stack_top:
 .global _start
 _start:
     cli
+    cld                     /* multiboot leaves DF undefined; the C ABI needs it clear */
     mov $stack_top, %esp
     push %ebx               /* kmain(magic, multiboot_info) */
     push %eax
