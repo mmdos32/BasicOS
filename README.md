@@ -4,8 +4,6 @@ A hobby 32-bit operating system for x86, written in C and assembly.
 It boots with GRUB (Multiboot) and runs under QEMU. No standard library:
 even `memcpy` and `strlen` are implemented in the kernel.
 
-Current version: **0.4**
-
 ## Quick start
 
 Prerequisites: a 32-bit-capable GCC toolchain (the build uses `-m32`),
