@@ -1,13 +1,13 @@
-/* kernel.c - BasicOS v0.5 (bug-fix release)
+/* kernel.c - BasicOS v0.6
  * VGA text + serial log, GDT/IDT, PIC/PIT, paging (NULL guard, read-only code),
- * keyboard (with history), preemptive multitasking with sleep, heap allocator,
- * in-memory filesystem, RTC clock, exception diagnostics, shell.
+ * keyboard (history, caps lock, ctrl keys), preemptive multitasking with sleep,
+ * heap allocator, in-memory filesystem, RTC clock, exception diagnostics, shell.
  */
 #include <stdint.h>
 #include <stddef.h>
 
 #define OS_NAME    "BasicOS"
-#define OS_VERSION "0.5"
+#define OS_VERSION "0.6"
 
 /* ---------------------------------------------------------------- port I/O */
 static inline void outb(uint16_t p, uint8_t v) { __asm__ volatile("outb %0, %1" :: "a"(v), "Nd"(p)); }
@@ -658,11 +658,24 @@ static const char kms[128] = {
 #define KEY_DOWN 0x81
 static volatile uint8_t kbuf[KBUF];
 static volatile int kb_head = 0, kb_tail = 0;
-static int lshift = 0, rshift = 0, ext = 0;
+static int lshift = 0, rshift = 0, lctrl = 0, rctrl = 0, ext = 0;
+static int caps = 0;
 
 static void kb_push(uint8_t c) {
     int next = (kb_head + 1) % KBUF;
     if (next != kb_tail) { kbuf[kb_head] = c; kb_head = next; }
+}
+
+/* caps lock LED: 0xED then a byte (bit 2 = caps). Bounded waits only, so a
+ * stuck 8042 can never hang the keyboard interrupt handler; the extra ack
+ * the keyboard sends back matches no key and is harmless. */
+static void kbd_set_leds(void) {
+    for (int i = 0; i < 10000 && (inb(0x64) & 2); i++) ;
+    outb(0x60, 0xED); io_wait();
+    for (int i = 0; i < 10000 && !(inb(0x64) & 1); i++) ;
+    if (inb(0x60) != 0xFA) return;                    /* no ack: leave the LEDs alone */
+    for (int i = 0; i < 10000 && (inb(0x64) & 2); i++) ;
+    outb(0x60, caps ? 0x04 : 0x00);
 }
 
 void keyboard_handler(void) {
@@ -672,14 +685,30 @@ void keyboard_handler(void) {
         ext = 0;
         if (sc == 0x48) kb_push(KEY_UP);
         else if (sc == 0x50) kb_push(KEY_DOWN);
+        else if (sc == 0x1D) rctrl = 1;
+        else if (sc == 0x9D) rctrl = 0;
     }
     else if (sc == 0x2A) lshift = 1;
     else if (sc == 0xAA) lshift = 0;
     else if (sc == 0x36) rshift = 1;
     else if (sc == 0xB6) rshift = 0;
+    else if (sc == 0x1D) lctrl = 1;
+    else if (sc == 0x9D) lctrl = 0;
+    else if (sc == 0x3A) { caps = !caps; kbd_set_leds(); }   /* caps lock toggles on press */
     else if (sc < 58) {
         char c = (lshift || rshift) ? kms[sc] : km[sc];
-        if (c) kb_push((uint8_t)c);
+        if (lctrl || rctrl) {
+            /* ctrl + letter -> control code (ctrl-c = 3, ctrl-l = 12, ...);
+             * ctrl + anything else is ignored */
+            if (c >= 'a' && c <= 'z') kb_push((uint8_t)(c - 'a' + 1));
+            else if (c >= 'A' && c <= 'Z') kb_push((uint8_t)(c - 'A' + 1));
+        } else {
+            if (caps) {
+                if (c >= 'a' && c <= 'z') c -= 32;      /* caps makes letters upper */
+                else if (c >= 'A' && c <= 'Z') c += 32;  /* shift + caps cancels out */
+            }
+            if (c) kb_push((uint8_t)c);
+        }
     }
     outb(0x20, 0x20);           /* EOI */
 }
@@ -733,6 +762,16 @@ static void readline(char *buf, int max) {
     for (;;) {
         uint8_t c = getchar();
         if (c == '\n') { putc('\n'); buf[len] = 0; return; }
+        if (c == 3) {                          /* ctrl-c: drop the line, fresh prompt */
+            while (len > 0) { len--; putc('\b'); }
+            puts("^C\n"); buf[0] = 0; return;
+        }
+        if (c == 12) {                         /* ctrl-l: repaint the screen */
+            clear_screen();
+            color = 0x0A; puts("basicos> "); color = text_color;
+            for (int i = 0; i < len; i++) putc(buf[i]);
+            continue;
+        }
         if (c == KEY_UP || c == KEY_DOWN) {
             if (c == KEY_UP && pos > 0 && pos > hist_count - HIST_N) pos--;
             else if (c == KEY_DOWN && pos < hist_count) pos++;
@@ -752,6 +791,7 @@ static void readline(char *buf, int max) {
 static void cmd_help(void) {
     puts("General (up/down arrows: history):\n"
          "  help, ver, clear, uptime, date, mem, history, reboot, halt\n"
+         "  caps lock toggles case, ctrl-c cancels the line, ctrl-l clears the screen\n"
          "  echo <text>         print text\n"
          "  color <1-15>        set text color\n"
          "  sleep <seconds>     pause the shell (other tasks keep running)\n"

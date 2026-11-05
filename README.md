@@ -29,8 +29,9 @@ At the `basicos>` prompt, type `help` for the full command list.
   the kernel itself).
 - **Multitasking:** preemptive, round-robin scheduling at 100 Hz,
   up to 8 tasks, with `sleep` and tick-based wake-up.
-- **Input:** PS/2 keyboard with a scancode table, Shift support, and
-  command history on the up/down arrow keys.
+- **Input:** PS/2 keyboard with a scancode table, Shift and Caps Lock
+  support, Ctrl-C/Ctrl-L line editing, and command history on the
+  up/down arrow keys.
 - **Memory:** a 256 KiB first-fit heap with splitting and coalescing.
 - **Filesystem:** an in-RAM filesystem with 16 files. It does not
   survive a reboot.
