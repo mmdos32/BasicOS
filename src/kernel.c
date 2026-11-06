@@ -1,180 +1,20 @@
-/* kernel.c - BasicOS v0.6
- * VGA text + serial log, GDT/IDT, PIC/PIT, paging (NULL guard, read-only code),
- * keyboard (history, caps lock, ctrl keys), preemptive multitasking with sleep,
- * heap allocator, in-memory filesystem, RTC clock, exception diagnostics, shell.
+/* kernel.c - BasicOS v0.7
+ * GDT/IDT, PIC/PIT, paging (NULL guard, read-only code), keyboard (history,
+ * caps lock, ctrl keys), preemptive multitasking with sleep, heap allocator,
+ * in-memory filesystem, RTC clock, exception diagnostics, shell.
+ * VGA/serial output and the small libc live in src/vga.c, src/serial.c and
+ * src/klib.c now (modular layout, part 1).
  */
 #include <stdint.h>
 #include <stddef.h>
 
+#include "io.h"
+#include "klib.h"
+#include "vga.h"
+#include "serial.h"
+
 #define OS_NAME    "BasicOS"
-#define OS_VERSION "0.6"
-
-/* ---------------------------------------------------------------- port I/O */
-static inline void outb(uint16_t p, uint8_t v) { __asm__ volatile("outb %0, %1" :: "a"(v), "Nd"(p)); }
-static inline uint8_t inb(uint16_t p) { uint8_t v; __asm__ volatile("inb %1, %0" : "=a"(v) : "Nd"(p)); return v; }
-
-/* hlt/cli/sti must also be compiler barriers: loops that wait for something an
- * interrupt handler changes would otherwise be free to cache the value in a register */
-static inline void cpu_halt(void) { __asm__ volatile("hlt" ::: "memory"); }
-static inline void cpu_cli(void)  { __asm__ volatile("cli" ::: "memory"); }
-static inline void cpu_sti(void)  { __asm__ volatile("sti" ::: "memory"); }
-static inline void io_wait(void)  { outb(0x80, 0); }      /* ~1 us delay for old PIC/PIT hardware */
-
-/* ---------------------------------------------------------------- libc bits */
-void *memcpy(void *d, const void *s, size_t n) {
-    uint8_t *dp = d; const uint8_t *sp = s;
-    while (n--) *dp++ = *sp++;
-    return d;
-}
-
-void *memset(void *d, int v, size_t n) {
-    uint8_t *dp = d;
-    while (n--) *dp++ = (uint8_t)v;
-    return d;
-}
-
-void *memmove(void *d, const void *s, size_t n) {
-    uint8_t *dp = d; const uint8_t *sp = s;
-    if (dp < sp) { while (n--) *dp++ = *sp++; }
-    else { dp += n; sp += n; while (n--) *--dp = *--sp; }
-    return d;
-}
-
-int memcmp(const void *a, const void *b, size_t n) {
-    const uint8_t *x = a, *y = b;
-    while (n--) { if (*x != *y) return *x - *y; x++; y++; }
-    return 0;
-}
-
-static size_t strlen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
-
-static int strcmp(const char *a, const char *b) {
-    while (*a && *a == *b) { a++; b++; }
-    return (uint8_t)*a - (uint8_t)*b;
-}
-
-static int atoi(const char *s) {
-    int n = 0;
-    while (*s >= '0' && *s <= '9') {
-        if (n > 100000000) return 100000000;    /* clamp instead of overflowing */
-        n = n * 10 + (*s++ - '0');
-    }
-    return n;
-}
-
-/* strips leading and trailing spaces in place; returns the new start of the string */
-static char *trim(char *s) {
-    while (*s == ' ') s++;
-    size_t n = strlen(s);
-    while (n > 0 && s[n - 1] == ' ') s[--n] = 0;
-    return s;
-}
-
-static void utoa(uint32_t n, char *buf) {
-    char tmp[12]; int i = 0, j = 0;
-    if (n == 0) tmp[i++] = '0';
-    while (n) { tmp[i++] = '0' + n % 10; n /= 10; }
-    while (i) buf[j++] = tmp[--i];
-    buf[j] = 0;
-}
-
-/* ---------------------------------------------------------------- VGA text */
-#define VGA ((volatile uint16_t *)0xB8000)
-#define COLS 80
-#define ROWS 25
-
-static int cx = 0, cy = 1;              /* row 0 is the status bar */
-static uint8_t color = 0x0F;
-static uint8_t text_color = 0x0F;      /* set by the "color" command */
-
-static void vga_at(int x, int y, char c, uint8_t col) {
-    VGA[y * COLS + x] = ((uint16_t)col << 8) | (uint8_t)c;
-}
-
-static void cursor_update(void) {
-    uint16_t pos = cy * COLS + cx;
-    outb(0x3D4, 14); outb(0x3D5, pos >> 8);
-    outb(0x3D4, 15); outb(0x3D5, pos & 0xFF);
-}
-
-static void scroll(void) {
-    for (int i = COLS; i < COLS * (ROWS - 1); i++) VGA[i] = VGA[i + COLS];
-    for (int i = 0; i < COLS; i++) vga_at(i, ROWS - 1, ' ', color);
-    cy = ROWS - 1;
-}
-
-/* ---------------------------------------------------------------- serial (COM1) log
- * Everything printed on screen is mirrored to COM1 (QEMU: -serial stdio).
- * The port is probed with a loopback test, so machines without one stay fast.
- */
-static int serial_ok = 0;
-
-static void serial_init(void) {
-    outb(0x3F9, 0x00);                  /* no interrupts */
-    outb(0x3FB, 0x80);                  /* DLAB on */
-    outb(0x3F8, 0x03); outb(0x3F9, 0x00);   /* 38400 baud */
-    outb(0x3FB, 0x03);                  /* 8N1 */
-    outb(0x3FA, 0xC7);                  /* FIFO */
-    outb(0x3FC, 0x1E);                  /* loopback mode */
-    outb(0x3F8, 0xAE);
-    if (inb(0x3F8) != 0xAE) return;     /* no UART here */
-    outb(0x3FC, 0x0F);                  /* normal operation */
-    serial_ok = 1;
-}
-
-static void serial_put(char c) {
-    for (int i = 0; i < 20000 && !(inb(0x3FD) & 0x20); i++) ;
-    outb(0x3F8, (uint8_t)c);
-}
-
-static void serial_mirror(char c) {
-    if (!serial_ok) return;
-    if (c == '\n') { serial_put('\r'); serial_put('\n'); }
-    else if (c == '\b') { serial_put('\b'); serial_put(' '); serial_put('\b'); }
-    else if (c == '\t') serial_put(' ');
-    else serial_put(c);
-}
-
-static int wrapped = 0;     /* the cursor auto-wrapped after filling the last column */
-
-static void putc(char c) {
-    serial_mirror(c);
-    if (c == '\n') {
-        if (wrapped) wrapped = 0;       /* already at the start of a fresh line: no blank line */
-        else { cx = 0; cy++; }
-    } else if (c == '\b') {
-        wrapped = 0;
-        if (cx > 0) { cx--; vga_at(cx, cy, ' ', color); }
-        else if (cy > 1) { cy--; cx = COLS - 1; vga_at(cx, cy, ' ', color); }   /* back over a wrap */
-    } else if (c == '\t') {
-        wrapped = 0;
-        cx = (cx + 4) & ~3;
-    } else {
-        wrapped = 0;
-        vga_at(cx, cy, c, color); cx++;
-    }
-    if (cx >= COLS) { cx = 0; cy++; if (c != '\n' && c != '\b') wrapped = 1; }
-    if (cy >= ROWS) scroll();
-    cursor_update();
-}
-
-static void puts(const char *s) { while (*s) putc(*s++); }
-
-static void put_uint(uint32_t n) { char b[12]; utoa(n, b); puts(b); }
-
-static void put_hex(uint32_t n) {
-    puts("0x");
-    for (int i = 28; i >= 0; i -= 4) putc("0123456789ABCDEF"[(n >> i) & 0xF]);
-}
-
-static void put_2(uint32_t n) { if (n < 10) putc('0'); put_uint(n); }
-
-static void clear_screen(void) {
-    for (int y = 1; y < ROWS; y++)
-        for (int x = 0; x < COLS; x++) vga_at(x, y, ' ', color);
-    cx = 0; cy = 1; wrapped = 0;
-    cursor_update();
-}
+#define OS_VERSION "0.7"
 
 /* ---------------------------------------------------------------- GDT */
 struct gdt_entry { uint16_t limit_lo, base_lo; uint8_t base_mid, access, gran, base_hi; } __attribute__((packed));

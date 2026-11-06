@@ -3,8 +3,12 @@ LD      = ld
 CFLAGS  = -m32 -std=gnu11 -O2 -Wall -Wextra -ffreestanding -fno-pic -fno-pie \
           -fno-stack-protector -fno-tree-loop-distribute-patterns \
           -fno-asynchronous-unwind-tables -fcf-protection=none \
-          -mno-sse -mno-mmx -nostdlib
-LDFLAGS = -m elf_i386 -T linker.ld -z noexecstack
+          -mno-sse -mno-mmx -nostdlib -Isrc
+LDFLAGS = -m elf_i386 -T boot/linker.ld -z noexecstack
+
+SRCS = $(wildcard src/*.c)
+OBJS = $(SRCS:.c=.o)
+HDRS = $(wildcard src/*.h)
 
 .PHONY: all run run-serial run-iso clean
 
@@ -12,14 +16,14 @@ QEMU_FLAGS ?= -display gtk
 
 all: basicos.iso
 
-boot.o: boot.s
-	$(CC) -m32 -c boot.s -o boot.o
+boot/boot.o: boot/boot.s
+	$(CC) -m32 -c boot/boot.s -o boot/boot.o
 
-kernel.o: kernel.c
-	$(CC) $(CFLAGS) -c kernel.c -o kernel.o
+src/%.o: src/%.c $(HDRS)
+	$(CC) $(CFLAGS) -c $< -o $@
 
-kernel.elf: boot.o kernel.o linker.ld
-	$(LD) $(LDFLAGS) -o kernel.elf boot.o kernel.o
+kernel.elf: boot/boot.o $(OBJS) boot/linker.ld
+	$(LD) $(LDFLAGS) -o kernel.elf boot/boot.o $(OBJS)
 
 basicos.iso: kernel.elf
 	mkdir -p iso/boot/grub
@@ -38,4 +42,4 @@ run-iso: basicos.iso
 	qemu-system-i386 $(QEMU_FLAGS) -cdrom basicos.iso
 
 clean:
-	rm -rf *.o kernel.elf iso basicos.iso
+	rm -rf boot/*.o src/*.o kernel.elf iso basicos.iso
