@@ -1,9 +1,11 @@
-/* kernel.c - BasicOS v0.7
- * GDT/IDT, PIC/PIT, paging (NULL guard, read-only code), keyboard (history,
- * caps lock, ctrl keys), preemptive multitasking with sleep, heap allocator,
- * in-memory filesystem, RTC clock, exception diagnostics, shell.
+/* kernel.c - BasicOS v0.8
+ * Keyboard (history, caps lock, ctrl keys), preemptive multitasking with
+ * sleep, in-memory filesystem, shell.
+ * The middle layer now lives in its own modules (modular layout, part 2):
+ * GDT/IDT/PIC/PIT in src/gdt.c and src/idt.c, paging in src/paging.c, heap
+ * in src/heap.c, RTC in src/rtc.c, panic in src/panic.c.
  * VGA/serial output and the small libc live in src/vga.c, src/serial.c and
- * src/klib.c now (modular layout, part 1).
+ * src/klib.c (modular layout, part 1).
  */
 #include <stdint.h>
 #include <stddef.h>
@@ -12,246 +14,15 @@
 #include "klib.h"
 #include "vga.h"
 #include "serial.h"
+#include "gdt.h"
+#include "idt.h"
+#include "paging.h"
+#include "heap.h"
+#include "rtc.h"
+#include "panic.h"
 
 #define OS_NAME    "BasicOS"
-#define OS_VERSION "0.7"
-
-/* ---------------------------------------------------------------- GDT */
-struct gdt_entry { uint16_t limit_lo, base_lo; uint8_t base_mid, access, gran, base_hi; } __attribute__((packed));
-struct dt_ptr { uint16_t limit; uint32_t base; } __attribute__((packed));
-
-static struct gdt_entry gdt[3];
-static struct dt_ptr gdtr;
-
-static void gdt_set(int i, uint8_t access, uint8_t gran) {
-    gdt[i].limit_lo = 0xFFFF; gdt[i].base_lo = 0; gdt[i].base_mid = 0;
-    gdt[i].access = access; gdt[i].gran = gran; gdt[i].base_hi = 0;
-}
-
-static void gdt_init(void) {
-    gdt_set(1, 0x9A, 0xCF);             /* code, ring 0, flat 4GB */
-    gdt_set(2, 0x92, 0xCF);             /* data, ring 0, flat 4GB */
-    gdtr.limit = sizeof(gdt) - 1;
-    gdtr.base = (uint32_t)&gdt;
-    __asm__ volatile("lgdt (%0)" :: "r"(&gdtr));
-    __asm__ volatile(
-        "mov $0x10, %%ax\n"
-        "mov %%ax, %%ds\n mov %%ax, %%es\n mov %%ax, %%fs\n mov %%ax, %%gs\n mov %%ax, %%ss\n"
-        "ljmp $0x08, $1f\n"
-        "1:\n" ::: "ax");
-}
-
-/* ---------------------------------------------------------------- IDT / PIC / PIT */
-struct idt_entry { uint16_t off_lo, sel; uint8_t zero, flags; uint16_t off_hi; } __attribute__((packed));
-static struct idt_entry idt[256];
-static struct dt_ptr idtr;
-
-extern void irq0_stub(void);
-extern void irq1_stub(void);
-extern void (*exc_table[32])(void);
-
-static void idt_set(int i, void (*h)(void)) {
-    uint32_t a = (uint32_t)h;
-    idt[i].off_lo = a & 0xFFFF; idt[i].sel = 0x08; idt[i].zero = 0;
-    idt[i].flags = 0x8E; idt[i].off_hi = a >> 16;
-}
-
-static void idt_init(void) {
-    for (int i = 0; i < 32; i++) idt_set(i, exc_table[i]);
-    idt_set(32, irq0_stub);
-    idt_set(33, irq1_stub);
-    idtr.limit = sizeof(idt) - 1;
-    idtr.base = (uint32_t)&idt;
-    __asm__ volatile("lidt (%0)" :: "r"(&idtr));
-}
-
-static void pic_init(void) {
-    outb(0x20, 0x11); io_wait(); outb(0xA0, 0x11); io_wait();
-    outb(0x21, 0x20); io_wait(); outb(0xA1, 0x28); io_wait();
-    outb(0x21, 0x04); io_wait(); outb(0xA1, 0x02); io_wait();
-    outb(0x21, 0x01); io_wait(); outb(0xA1, 0x01); io_wait();
-    outb(0x21, 0xFC);                    /* unmask IRQ0 (timer) + IRQ1 (keyboard) */
-    outb(0xA1, 0xFF);
-}
-
-#define TIMER_HZ 100
-static volatile uint32_t ticks = 0;
-
-static void pit_init(void) {
-    uint16_t div = 1193182 / TIMER_HZ;
-    outb(0x43, 0x36);
-    outb(0x40, div & 0xFF);
-    outb(0x40, div >> 8);
-}
-
-/* ---------------------------------------------------------------- exceptions */
-struct exc_frame {
-    uint32_t edi, esi, ebp, esp, ebx, edx, ecx, eax;    /* pusha */
-    uint32_t vector, err;
-    uint32_t eip, cs, eflags;                           /* pushed by the CPU */
-};
-
-static const char *exc_names[32] = {
-    "Divide error", "Debug", "NMI", "Breakpoint", "Overflow", "Bound range exceeded",
-    "Invalid opcode", "Device not available", "Double fault", "Coprocessor overrun",
-    "Invalid TSS", "Segment not present", "Stack fault", "General protection fault",
-    "Page fault", "Reserved", "x87 FPU error", "Alignment check", "Machine check",
-    "SIMD FP error"
-};
-
-void exception_handler(struct exc_frame *f) {
-    color = 0x4F;
-    puts("\n*** CPU EXCEPTION: ");
-    puts(f->vector < 32 && exc_names[f->vector] ? exc_names[f->vector] : "Reserved");
-    puts(" ***\n");
-    puts("vector "); put_uint(f->vector);
-    puts("  error "); put_hex(f->err);
-    if (f->vector == 14) {
-        uint32_t cr2;
-        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
-        puts("\nfaulting address "); put_hex(cr2);
-        puts((f->err & 1) ? " (protection violation, " : " (page not present, ");
-        puts((f->err & 2) ? "write)" : "read)");
-    }
-    puts("\nEIP "); put_hex(f->eip);
-    puts("  CS "); put_hex(f->cs);
-    puts("  EFLAGS "); put_hex(f->eflags);
-    puts("\nEAX "); put_hex(f->eax);
-    puts("  EBX "); put_hex(f->ebx);
-    puts("\nECX "); put_hex(f->ecx);
-    puts("  EDX "); put_hex(f->edx);
-    puts("\nSystem halted.\n");
-}
-
-/* ---------------------------------------------------------------- interrupt flag helpers */
-static uint32_t irq_save(void) {
-    uint32_t f;
-    __asm__ volatile("pushf; pop %0; cli" : "=r"(f) :: "memory");
-    return f;
-}
-
-static void irq_restore(uint32_t f) {
-    __asm__ volatile("push %0; popf" :: "r"(f) : "memory", "cc");
-}
-
-/* ---------------------------------------------------------------- RTC clock (CMOS) */
-typedef struct { uint8_t sec, min, hour, day, mon; uint16_t year; } rtc_t;
-
-static uint8_t cmos(uint8_t reg) { outb(0x70, reg); return inb(0x71); }
-
-#define BCD(x) ((uint8_t)(((x) & 0x0F) + ((x) >> 4) * 10))
-
-static void rtc_read(rtc_t *t) {
-    /* the index/data ports are shared, so no task switch may happen in between */
-    uint32_t fl = irq_save();
-    for (int i = 0; i < 100000 && (cmos(0x0A) & 0x80); i++) ;
-    uint8_t s = cmos(0x00), m = cmos(0x02), h = cmos(0x04);
-    uint8_t d = cmos(0x07), mo = cmos(0x08), y = cmos(0x09), b = cmos(0x0B);
-    irq_restore(fl);
-
-    int pm = h & 0x80;
-    h &= 0x7F;
-    if (!(b & 4)) { s = BCD(s); m = BCD(m); h = BCD(h); d = BCD(d); mo = BCD(mo); y = BCD(y); }
-    if (!(b & 2)) h = pm ? (h % 12) + 12 : h % 12;      /* 12-hour mode */
-    t->sec = s; t->min = m; t->hour = h; t->day = d; t->mon = mo; t->year = 2000 + y;
-}
-
-/* ---------------------------------------------------------------- heap allocator
- * First-fit free list over a static arena. Only the shell (task 0) allocates,
- * so no locking is needed.
- */
-#define HEAP_SIZE (256 * 1024)
-
-typedef struct block {
-    uint32_t size;
-    uint32_t free;
-    struct block *next;
-    uint32_t pad;               /* keeps the header at 16 bytes */
-} block_t;
-
-static uint8_t heap[HEAP_SIZE] __attribute__((aligned(16)));
-static block_t *heap_head;
-
-static void heap_init(void) {
-    heap_head = (block_t *)heap;
-    heap_head->size = HEAP_SIZE - sizeof(block_t);
-    heap_head->free = 1;
-    heap_head->next = NULL;
-}
-
-static void *kmalloc(uint32_t n) {
-    if (n > HEAP_SIZE) return NULL;     /* also keeps the rounding below from wrapping */
-    n = (n + 15) & ~15u;
-    if (n == 0) n = 16;
-    for (block_t *b = heap_head; b; b = b->next) {
-        if (!b->free || b->size < n) continue;
-        if (b->size >= n + sizeof(block_t) + 16) {      /* split */
-            block_t *s = (block_t *)((uint8_t *)(b + 1) + n);
-            s->size = b->size - n - sizeof(block_t);
-            s->free = 1;
-            s->next = b->next;
-            b->next = s;
-            b->size = n;
-        }
-        b->free = 0;
-        return b + 1;
-    }
-    return NULL;
-}
-
-static void kfree(void *p) {
-    if (!p) return;
-    uint8_t *q = p;
-    if (q < heap + sizeof(block_t) || q >= heap + HEAP_SIZE) return;    /* not a heap pointer */
-    block_t *b = (block_t *)p - 1;
-    if (b->free) return;                                                /* double free */
-    b->free = 1;
-    for (block_t *c = heap_head; c; c = c->next) {      /* coalesce */
-        while (c->free && c->next && c->next->free) {
-            c->size += sizeof(block_t) + c->next->size;
-            c->next = c->next->next;
-        }
-    }
-}
-
-static void heap_stats(uint32_t *used, uint32_t *freeb) {
-    *used = 0; *freeb = 0;
-    for (block_t *b = heap_head; b; b = b->next) {
-        if (b->free) *freeb += b->size; else *used += b->size;
-    }
-}
-
-/* ---------------------------------------------------------------- paging
- * Identity-maps the first 16 MB with 4 KB pages. Page 0 is left unmapped, so a
- * NULL dereference faults; kernel code and read-only data are mapped read-only
- * (CR0.WP makes that apply to the kernel itself).
- */
-#define PAGE_SIZE   4096
-#define MAP_TABLES  4                           /* 4 x 4 MB = 16 MB */
-
-extern char __ro_end[];                         /* from linker.ld */
-
-static uint32_t page_dir[1024] __attribute__((aligned(4096)));
-static uint32_t page_tables[MAP_TABLES][1024] __attribute__((aligned(4096)));
-
-static void paging_init(void) {
-    uint32_t ro_end = (uint32_t)__ro_end;
-    for (int t = 0; t < MAP_TABLES; t++) {
-        for (int i = 0; i < 1024; i++) {
-            uint32_t addr = ((uint32_t)t * 1024 + i) * PAGE_SIZE;
-            uint32_t flags = 3;                 /* present + writable */
-            if (addr == 0) { page_tables[t][i] = 0; continue; }
-            if (addr >= 0x100000 && addr < ro_end) flags = 1;   /* present, read-only */
-            page_tables[t][i] = addr | flags;
-        }
-        page_dir[t] = (uint32_t)page_tables[t] | 3;
-    }
-    __asm__ volatile("mov %0, %%cr3" :: "r"(page_dir));
-    uint32_t cr0;
-    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
-    cr0 |= 0x80010000u;                         /* PG + WP */
-    __asm__ volatile("mov %0, %%cr0" :: "r"(cr0) : "memory");
-}
+#define OS_VERSION "0.8"
 
 /* ---------------------------------------------------------------- RAM filesystem */
 #define MAX_FILES 16
@@ -344,15 +115,6 @@ static void fs_err(int r) {
     case -5: puts("target already exists\n"); break;
     default: puts("ok\n");
     }
-}
-
-/* ---------------------------------------------------------------- panic */
-static void panic(const char *msg, int id) {
-    cpu_cli();
-    color = 0x4F;
-    puts("\n*** KERNEL PANIC: "); puts(msg);
-    puts(" (task "); put_uint((uint32_t)id); puts(") ***\nSystem halted.\n");
-    for (;;) cpu_halt();
 }
 
 /* ---------------------------------------------------------------- multitasking */
