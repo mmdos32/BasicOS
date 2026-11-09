@@ -3,7 +3,7 @@
 
 struct gdt_entry { uint16_t limit_lo, base_lo; uint8_t base_mid, access, gran, base_hi; } __attribute__((packed));
 
-static struct gdt_entry gdt[3];
+static struct gdt_entry gdt[5];
 static struct dt_ptr gdtr;
 
 static void gdt_set(int i, uint8_t access, uint8_t gran) {
@@ -14,6 +14,8 @@ static void gdt_set(int i, uint8_t access, uint8_t gran) {
 void gdt_init(void) {
     gdt_set(1, 0x9A, 0xCF);             /* code, ring 0, flat 4GB */
     gdt_set(2, 0x92, 0xCF);             /* data, ring 0, flat 4GB */
+    gdt_set(3, 0xFA, 0xCF);             /* code, ring 3, flat 4GB (unused for now) */
+    gdt_set(4, 0xF2, 0xCF);             /* data, ring 3, flat 4GB (unused for now) */
     gdtr.limit = sizeof(gdt) - 1;
     gdtr.base = (uint32_t)&gdt;
     __asm__ volatile("lgdt (%0)" :: "r"(&gdtr));

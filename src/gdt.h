@@ -1,4 +1,4 @@
-/* gdt.h - Global Descriptor Table (flat 4 GB, ring 0 only for now). */
+/* gdt.h - Global Descriptor Table (flat 4 GB; ring-3 code/data present, unused for now). */
 #ifndef BASIC_GDT_H
 #define BASIC_GDT_H
 
