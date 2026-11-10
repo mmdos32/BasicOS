@@ -18,6 +18,7 @@
 #include "sched.h"
 #include "serial.h"
 #include "shell.h"
+#include "tss.h"
 #include "version.h"
 #include "vga.h"
 
@@ -31,6 +32,7 @@ void kmain(uint32_t magic, struct mb_info *mbi) {
 
     serial_init();
     gdt_init();
+    tss_init();
     idt_init();
     pic_init();
     pit_init();
