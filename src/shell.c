@@ -12,6 +12,7 @@
 #include "rtc.h"
 #include "sched.h"
 #include "shell.h"
+#include "syscall.h"
 #include "version.h"
 #include "vga.h"
 
@@ -88,7 +89,8 @@ static void cmd_help(void) {
          "  append <f> <text>   add to the end of a file\n"
          "  cp <src> <dst>, mv <old> <new>\n"
          "Debug:\n"
-         "  crash <null|code|div|ud>   trigger a CPU exception on purpose\n");
+         "  crash <null|code|div|ud>   trigger a CPU exception on purpose\n"
+         "  syscall           test the syscall gate from ring 3\n");
 }
 
 /* splits "first rest" in place; returns the trimmed rest */
@@ -213,6 +215,11 @@ void shell(void) {
             else if (!strcmp(arg, "div")) { volatile int z = 0; volatile int r = 1 / z; (void)r; }
             else if (!strcmp(arg, "ud")) __asm__ volatile("ud2");
             else puts("usage: crash <null|code|div|ud>\n");
+        }
+        else if (!strcmp(cmd, "syscall")) {
+            int id = task_spawn(ring3_test, "ring3test");
+            if (id < 0) puts("no free task slots\n");
+            else { puts("started task "); put_uint(id); putc('\n'); }
         }
         else if (!strcmp(cmd, "reboot")) reboot();
         else if (!strcmp(cmd, "halt")) {

@@ -48,6 +48,19 @@ irq1_stub:
     popa
     iret
 
+/* int 0x80 (syscall gate): save state, dispatch in C, return or switch tasks */
+.global syscall_stub
+syscall_stub:
+    pusha
+    push %esp
+    call syscall_handler      /* eax = 0: return to caller; else the next task's esp */
+    add $4, %esp
+    test %eax, %eax
+    jz 1f
+    mov %eax, %esp
+1:  popa
+    iret
+
 /* CPU exceptions: build a frame (regs, vector, error code) and report it in C */
 .macro EXC_NOERR num
 exc\num:

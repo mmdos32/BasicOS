@@ -12,18 +12,22 @@ static struct dt_ptr idtr;
 
 extern void irq0_stub(void);
 extern void irq1_stub(void);
+extern void syscall_stub(void);
 extern void (*exc_table[32])(void);
 
-static void idt_set(int i, void (*h)(void)) {
+static void idt_set_flags(int i, void (*h)(void), uint8_t flags) {
     uint32_t a = (uint32_t)h;
     idt[i].off_lo = a & 0xFFFF; idt[i].sel = 0x08; idt[i].zero = 0;
-    idt[i].flags = 0x8E; idt[i].off_hi = a >> 16;
+    idt[i].flags = flags; idt[i].off_hi = a >> 16;
 }
+
+static void idt_set(int i, void (*h)(void)) { idt_set_flags(i, h, 0x8E); }
 
 void idt_init(void) {
     for (int i = 0; i < 32; i++) idt_set(i, exc_table[i]);
     idt_set(32, irq0_stub);
     idt_set(33, irq1_stub);
+    idt_set_flags(0x80, syscall_stub, 0xEE);   /* int 0x80: callable from ring 3 */
     idtr.limit = sizeof(idt) - 1;
     idtr.base = (uint32_t)&idt;
     __asm__ volatile("lidt (%0)" :: "r"(&idtr));

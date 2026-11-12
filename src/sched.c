@@ -55,6 +55,20 @@ static void task_exit(void) {
     for (;;) cpu_halt();
 }
 
+/* terminate the calling task (used by the exit syscall) and switch to the
+ * next ready one; returns the next task's esp, or 0 if none is ready. */
+uint32_t task_exit_now(void) {
+    tasks[cur].state = 0;
+    int n = cur;
+    for (int k = 0; k < MAX_TASKS; k++) {
+        n = (n + 1) % MAX_TASKS;
+        if (tasks[n].state == 1) break;
+    }
+    if (tasks[n].state != 1) return 0;
+    cur = n;
+    return tasks[cur].esp;
+}
+
 static void task_main(void) {
     tasks[cur].entry();
     task_exit();
