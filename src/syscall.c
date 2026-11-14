@@ -1,4 +1,4 @@
-/* syscall.c - the int 0x80 gate: write (fd 1 only) + exit, and the ring-3 test. */
+/* syscall.c - the int 0x80 gate: write (fd 1 only) + exit + sleep, and the ring-3 test. */
 #include <stdint.h>
 
 #include "io.h"
@@ -21,6 +21,18 @@ uint32_t syscall_handler(struct syscall_frame *f) {
         f->eax = len;
         return 0;
     }
+    if (f->eax == SYS_SLEEP) {
+        /* the 0x80 gate is an interrupt gate, so IF is clear on entry;
+         * task_sleep halts until the timer tick wakes it, so re-enable
+         * interrupts first or the sleeper deadlocks (hlt with IF=0
+         * never wakes). iret restores the caller's eflags on return. */
+        uint32_t ms = f->ebx;
+        if (ms > 60000) ms = 60000;      /* keep ms * TIMER_HZ in range */
+        __asm__ volatile("sti");
+        task_sleep(ms);
+        f->eax = 0;
+        return 0;
+    }
     if (f->eax == SYS_EXIT) {
         uint32_t next = task_exit_now();
         if (!next) {
@@ -40,10 +52,21 @@ uint32_t syscall_handler(struct syscall_frame *f) {
 __attribute__((section(".user_text")))
 static void ring3_entry(void) {
     static const char msg[] = "hello from ring 3\n";
+    static const char msg2[] = "slept 500ms, exiting\n";
     uint32_t ret;
     __asm__ volatile("int $0x80"
                      : "=a"(ret)
                      : "a"((uint32_t)SYS_WRITE), "b"(1), "c"(msg), "d"(sizeof(msg) - 1)
+                     : "memory");
+    (void)ret;
+    __asm__ volatile("int $0x80"
+                     : "=a"(ret)
+                     : "a"((uint32_t)SYS_SLEEP), "b"(500)
+                     : "memory");
+    (void)ret;
+    __asm__ volatile("int $0x80"
+                     : "=a"(ret)
+                     : "a"((uint32_t)SYS_WRITE), "b"(1), "c"(msg2), "d"(sizeof(msg2) - 1)
                      : "memory");
     (void)ret;
     __asm__ volatile("int $0x80" :: "a"((uint32_t)SYS_EXIT), "b"(0) : "memory");

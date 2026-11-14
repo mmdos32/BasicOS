@@ -1,4 +1,4 @@
-/* syscall.h - the int 0x80 syscall gate: write + exit, and the ring-3 test. */
+/* syscall.h - the int 0x80 syscall gate: write + exit + sleep, and the ring-3 test. */
 #ifndef BASIC_SYSCALL_H
 #define BASIC_SYSCALL_H
 
@@ -6,6 +6,7 @@
 
 #define SYS_EXIT  0
 #define SYS_WRITE 1
+#define SYS_SLEEP 2
 
 /* the stack frame the syscall stub builds (pusha regs, then the CPU frame) */
 struct syscall_frame {

@@ -1,7 +1,8 @@
 /* tss.h - Task State Segment (32-bit, 104 bytes).
  * Holds the ring-0 stack the CPU switches to on a ring-3 -> ring-0
- * transition. Only ss0/esp0 are used for now; the rest is zeroed.
- * Loaded with ltr during init; nothing runs in ring 3 yet.
+ * transition: a dedicated stack in tss.c, separate from the boot stack
+ * the shell runs on. Only ss0/esp0 are used for now; the rest is zeroed.
+ * Loaded with ltr during init.
  */
 #ifndef BASIC_TSS_H
 #define BASIC_TSS_H
