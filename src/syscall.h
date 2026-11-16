@@ -1,4 +1,4 @@
-/* syscall.h - the int 0x80 syscall gate: write + exit + sleep, and the ring-3 test. */
+/* syscall.h - the int 0x80 syscall gate: write + exit + sleep + yield, and the ring-3 test. */
 #ifndef BASIC_SYSCALL_H
 #define BASIC_SYSCALL_H
 
@@ -7,6 +7,7 @@
 #define SYS_EXIT  0
 #define SYS_WRITE 1
 #define SYS_SLEEP 2
+#define SYS_YIELD 3
 
 /* the stack frame the syscall stub builds (pusha regs, then the CPU frame) */
 struct syscall_frame {
@@ -17,7 +18,7 @@ struct syscall_frame {
 
 /* called from syscall_stub with the interrupted task's frame.
  * Returns 0 to return to the caller, or the next task's esp to switch
- * (only the exit path switches). */
+ * (the exit and yield paths switch). */
 uint32_t syscall_handler(struct syscall_frame *f);
 
 /* jump to ring 3, write via int 0x80, then exit (spawned by the shell) */

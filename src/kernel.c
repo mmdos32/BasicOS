@@ -1,4 +1,4 @@
-/* kernel.c - BasicOS v0.13
+/* kernel.c - BasicOS v0.14
  * Entry point only: kmain and init.
  * The modular layout is now complete (part 3): keyboard in src/keyboard.c,
  * the scheduler in src/sched.c, the in-memory filesystem in src/fs.c and

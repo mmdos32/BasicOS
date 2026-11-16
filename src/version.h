@@ -3,6 +3,6 @@
 #define BASIC_VERSION_H
 
 #define OS_NAME    "BasicOS"
-#define OS_VERSION "0.13"
+#define OS_VERSION "0.14"
 
 #endif

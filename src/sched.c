@@ -69,6 +69,21 @@ uint32_t task_exit_now(void) {
     return tasks[cur].esp;
 }
 
+/* voluntarily give the CPU to the next ready task (used by the yield
+ * syscall); the caller's frame esp is saved so the scheduler can resume
+ * it right after the int 0x80 when the task is picked again. */
+uint32_t task_yield_now(uint32_t esp) {
+    tasks[cur].esp = esp;
+    int n = cur;
+    for (int k = 0; k < MAX_TASKS; k++) {
+        n = (n + 1) % MAX_TASKS;
+        if (tasks[n].state == 1) break;
+    }
+    if (n == cur || tasks[n].state != 1) return 0;  /* nobody else ready */
+    cur = n;
+    return tasks[cur].esp;
+}
+
 static void task_main(void) {
     tasks[cur].entry();
     task_exit();

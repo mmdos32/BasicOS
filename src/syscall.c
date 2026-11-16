@@ -1,4 +1,4 @@
-/* syscall.c - the int 0x80 gate: write (fd 1 only) + exit + sleep, and the ring-3 test. */
+/* syscall.c - the int 0x80 gate: write (fd 1 only) + exit + sleep + yield, and the ring-3 test. */
 #include <stdint.h>
 
 #include "io.h"
@@ -33,6 +33,13 @@ uint32_t syscall_handler(struct syscall_frame *f) {
         f->eax = 0;
         return 0;
     }
+    if (f->eax == SYS_YIELD) {
+        /* save the caller's frame so the scheduler can resume it right
+         * after the int 0x80, then switch to the next ready task.
+         * 0 means no other task is ready: return to the caller at once. */
+        f->eax = 0;
+        return task_yield_now((uint32_t)f);
+    }
     if (f->eax == SYS_EXIT) {
         uint32_t next = task_exit_now();
         if (!next) {
@@ -52,7 +59,8 @@ uint32_t syscall_handler(struct syscall_frame *f) {
 __attribute__((section(".user_text")))
 static void ring3_entry(void) {
     static const char msg[] = "hello from ring 3\n";
-    static const char msg2[] = "slept 500ms, exiting\n";
+    static const char msg2[] = "slept 500ms, yielding\n";
+    static const char msg3[] = "yielded, exiting\n";
     uint32_t ret;
     __asm__ volatile("int $0x80"
                      : "=a"(ret)
@@ -67,6 +75,16 @@ static void ring3_entry(void) {
     __asm__ volatile("int $0x80"
                      : "=a"(ret)
                      : "a"((uint32_t)SYS_WRITE), "b"(1), "c"(msg2), "d"(sizeof(msg2) - 1)
+                     : "memory");
+    (void)ret;
+    __asm__ volatile("int $0x80"
+                     : "=a"(ret)
+                     : "a"((uint32_t)SYS_YIELD)
+                     : "memory");
+    (void)ret;
+    __asm__ volatile("int $0x80"
+                     : "=a"(ret)
+                     : "a"((uint32_t)SYS_WRITE), "b"(1), "c"(msg3), "d"(sizeof(msg3) - 1)
                      : "memory");
     (void)ret;
     __asm__ volatile("int $0x80" :: "a"((uint32_t)SYS_EXIT), "b"(0) : "memory");

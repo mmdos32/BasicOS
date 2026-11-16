@@ -30,6 +30,12 @@ int task_spawn(void (*fn)(void), const char *name);
  * next ready one; returns the next task's esp, or 0 if none is ready. */
 uint32_t task_exit_now(void);
 
+/* voluntarily give the CPU to the next ready task (used by the yield
+ * syscall); `esp` is the caller's saved frame, resumed when the task is
+ * picked again. Returns the next task's esp, or 0 if no other task is
+ * ready (the caller then returns to the yielding task at once). */
+uint32_t task_yield_now(uint32_t esp);
+
 /* block the calling task for at least `ms` milliseconds; other tasks keep running */
 void task_sleep(uint32_t ms);
 
